@@ -30,7 +30,7 @@ pub enum WorkerResponse {
     SearchProgress(usize),
 }
 
-const RENDER_MARGIN: usize = 100;
+const RENDER_MARGIN: usize = 5;
 
 pub fn worker_thread(
     mut source: Box<dyn DataSource>,

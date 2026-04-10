@@ -2,21 +2,25 @@ use std::sync::{Arc, RwLock};
 
 use lru::LruCache;
 
-/// LRU cache that evicts based on total memory usage rather than item count.
+/// LRU cache that evicts based on total memory usage rather than item count,
+/// but guarantees at least `min_items` entries are retained (growing the budget
+/// if necessary for degenerate large-row cases).
 pub struct SizedLruCache<K: std::hash::Hash + Eq + Clone, V> {
     entries: LruCache<K, V>,
     sizes: LruCache<K, usize>,
     current_bytes: usize,
     max_bytes: usize,
+    min_items: usize,
 }
 
 impl<K: std::hash::Hash + Eq + Clone, V> SizedLruCache<K, V> {
-    pub fn new(max_bytes: usize) -> Self {
+    pub fn new(max_bytes: usize, min_items: usize) -> Self {
         SizedLruCache {
             entries: LruCache::unbounded(),
             sizes: LruCache::unbounded(),
             current_bytes: 0,
             max_bytes,
+            min_items,
         }
     }
 
@@ -31,7 +35,9 @@ impl<K: std::hash::Hash + Eq + Clone, V> SizedLruCache<K, V> {
             self.current_bytes -= old_size;
         }
 
-        while self.current_bytes + size > self.max_bytes {
+        while self.current_bytes + size > self.max_bytes
+            && self.entries.len() >= self.min_items
+        {
             if let Some((evicted_key, evicted_size)) = self.sizes.pop_lru() {
                 self.entries.pop(&evicted_key);
                 self.current_bytes -= evicted_size;
@@ -50,8 +56,8 @@ impl<K: std::hash::Hash + Eq + Clone, V> SizedLruCache<K, V> {
     }
 }
 
-/// 2 MB budget for rendered row strings
 const RENDERED_CACHE_BUDGET: usize = 2 * 1024 * 1024;
+const RENDERED_CACHE_MIN_ITEMS: usize = 10;
 
 use crate::render::RenderedRow;
 
@@ -63,7 +69,7 @@ pub struct RowCache {
 impl RowCache {
     pub fn new() -> Self {
         RowCache {
-            inner: RwLock::new(SizedLruCache::new(RENDERED_CACHE_BUDGET)),
+            inner: RwLock::new(SizedLruCache::new(RENDERED_CACHE_BUDGET, RENDERED_CACHE_MIN_ITEMS)),
         }
     }
 

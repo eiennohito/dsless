@@ -160,6 +160,8 @@ fn run_app(
 
     // Tracks the last visible row from the most recent draw pass
     let mut last_visible_row: usize = 0;
+    // Set during draw when a cache miss is detected
+    let mut draw_had_cache_miss;
 
     loop {
         // Drain background responses
@@ -204,6 +206,7 @@ fn run_app(
         }
 
         // Draw
+        draw_had_cache_miss = false;
         terminal.draw(|frame| {
             let area = frame.area();
             let visible_height = area.height.saturating_sub(3) as usize;
@@ -240,6 +243,7 @@ fn run_app(
                         lines_remaining -= 1;
                     }
                 } else {
+                    draw_had_cache_miss = true;
                     display.push(Line::from(Span::styled(
                         format!("  Loading row {}...", row),
                         Style::default().fg(Color::DarkGray),
@@ -305,6 +309,12 @@ fn run_app(
                 render_help_popup(frame, area);
             }
         })?;
+
+        // If the draw had cache misses, re-request rendering so the
+        // worker fills in the missing rows.
+        if draw_had_cache_miss {
+            worker_tx.send(WorkerRequest::RenderAround(current_row))?;
+        }
 
         let visible_height = terminal.size()?.height.saturating_sub(3) as usize;
 
