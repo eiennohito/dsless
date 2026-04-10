@@ -13,6 +13,10 @@ dsless data.parquet | head    # pipe mode, plain text output
 
 Renders nested structs, arrays-of-structs-as-tables, and deeply nested lists in a readable tree layout with CJK-aware column alignment.
 
+## AI-Assisted coding disclaimer
+
+This project is written in fully AI-assisted manner. Most of the code is generated. If you do not like AI slop, you know what it is.
+
 ## Why
 
 Existing tools (`parquet-tools`, `duckdb`, pandas) choke on complex nested schemas — arrays of structs with nested lists render as unreadable JSON blobs or get truncated. dsless renders them as indented trees with vertical guides and auto-tables:
