@@ -774,6 +774,7 @@ dependencies = [
  "arrow",
  "clap",
  "crossterm",
+ "lru",
  "parquet",
  "ratatui",
  "unicode-width",
