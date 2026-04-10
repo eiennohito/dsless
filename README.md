@@ -87,22 +87,12 @@ dsless <path> | less        # pipe mode: plain text, no TUI
 | `N` | Previous match |
 | Esc | Clear search |
 
-Search is two-level:
-1. **Record level** — finds records containing the query (scans parquet columns directly, up to 100 matches at a time)
-2. **Within-record** — highlights matching lines inside the current record
+Search is two-level: first finds matching records (scanning parquet columns directly), then highlights matching lines within the current record.
 
 Status bar shows: `/{query}: {N} records, {M} in record`
-
-## Architecture
-
-- **Lazy loading** — reads only parquet metadata on startup; row groups loaded on demand with LRU cache
-- **Background rendering** — data loading and row rendering run on a background thread; UI never blocks on I/O
-- **Virtualized display** — only rows near the viewport are rendered; rendered rows cached with a size-bounded LRU (2MB budget)
-- **Allocation-efficient rendering** — reusable `LineWriter` buffer; after warmup, rendering a row costs ~3 heap allocations regardless of row complexity
-- **CJK-aware** — column alignment uses Unicode display widths, not byte/char counts
 
 ## Supported formats
 
 - **Parquet** (`.parquet`) — including zstd/snappy/gzip compression, partitioned directories
 
-Planned: JSONL, ORC, CSV. The `DataSource` trait abstracts format-specific loading; adding a format means implementing 5 methods.
+Planned: JSONL, ORC, CSV.

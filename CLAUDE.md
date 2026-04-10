@@ -50,3 +50,7 @@ Plans are handoff docs for keeping context between cold-start sessions. They are
 - **Lifecycle**: Plans exist while work is in-flight. When the work is done, **delete the plan** and push its knowledge into persistent artifacts (Docstrings, AGENTS.md, test descriptions, doc files). Completed plans left in the workspace become stale context that misleads future sessions.
 - **Index (`docs/plans/_index.md`)**: Tracks active plans (one-liner + status per file) and a **parking lot** for small ideas — the "we should do this, maybe later" observations that aren't worth a plan file yet. Update the index when creating or deleting plans, and when ideas come up during any session.
 - **When to plan**: If you need to think before coding, the thinking goes in a plan. If you don't, just code. Mixing planning and implementation in the same pass compounds errors — for complex tasks, write the plan first, then implement.
+
+## Architecture
+
+See [docs](./docs/architecture.md)
