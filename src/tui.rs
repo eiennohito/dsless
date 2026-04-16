@@ -133,17 +133,19 @@ fn run_app(
     mut source: Box<dyn DataSource>,
 ) -> Result<()> {
     let total_rows = source.total_rows();
-    let terminal_width = terminal.size()?.width as usize;
+    let initial_size = terminal.size()?;
+    let mut terminal_width = initial_size.width as usize;
 
-    // Compute Layout (single source of truth) and resolve RenderSpec
+    // Layout is terminal-independent; RenderSpec is resolved per terminal width
     let layout = Layout::compute(source.as_mut());
-    let spec = Arc::new(RenderSpec::resolve(&layout, terminal_width));
+    let mut spec = Arc::new(RenderSpec::resolve(&layout, terminal_width));
     let is_table = spec.is_table();
 
-    let schema_header = if is_table {
+    let vertical_header = if is_table { Vec::new() } else { build_schema_header(source.as_ref()) };
+    let mut schema_header = if is_table {
         spec.render_table_header()
     } else {
-        build_schema_header(source.as_ref())
+        vertical_header.clone()
     };
 
     let cache = Arc::new(RowCache::new());
@@ -177,8 +179,8 @@ fn run_app(
         }
     }
 
-    let initial_height = terminal.size()?.height.saturating_sub(3) as usize;
-    worker_tx.send(render_range_for(0, initial_height, is_table, lookahead, total_rows))?;
+    let mut visible_height = initial_size.height.saturating_sub(3) as usize;
+    worker_tx.send(render_range_for(0, visible_height, is_table, lookahead, total_rows))?;
 
     let mut current_row: usize = 0;
     let mut line_offset: usize = 0;
@@ -220,17 +222,16 @@ fn run_app(
                             && let Some(&row) = s.matched_rows.first()
                         {
                             s.current_idx = 0;
-                            let vh = terminal.size()?.height.saturating_sub(3) as usize;
                             navigate_to_match(
                                 &cache,
                                 s,
                                 row,
                                 &mut current_row,
                                 &mut line_offset,
-                                vh,
+                                visible_height,
                             );
                             show_header = false;
-                            worker_tx.send(render_range_for(row, vh, is_table, lookahead, total_rows))?;
+                            worker_tx.send(render_range_for(row, visible_height, is_table, lookahead, total_rows))?;
                         }
                     }
                 }
@@ -244,7 +245,7 @@ fn run_app(
         draw_had_cache_miss = false;
         terminal.draw(|frame| {
             let area = frame.area();
-            let visible_height = area.height.saturating_sub(3) as usize;
+            visible_height = area.height.saturating_sub(3) as usize;
 
             let mut display: Vec<Line> = Vec::with_capacity(visible_height);
             let mut lines_remaining = visible_height;
@@ -347,8 +348,6 @@ fn run_app(
             }
         })?;
 
-        let visible_height = terminal.size()?.height.saturating_sub(3) as usize;
-
         // If the draw had cache misses, request the visible range + lookahead.
         if draw_had_cache_miss {
             // last_visible_row is the furthest row the draw loop tried to show.
@@ -365,7 +364,23 @@ fn run_app(
             continue;
         }
 
-        if let Event::Key(key) = event::read()? {
+        match event::read()? {
+        Event::Resize(w, _h) => {
+            let new_width = w as usize;
+            if new_width != terminal_width {
+                terminal_width = new_width;
+                spec = Arc::new(RenderSpec::resolve(&layout, terminal_width));
+                schema_header = if is_table {
+                    spec.render_table_header()
+                } else {
+                    vertical_header.clone()
+                };
+                cache.clear();
+                worker_tx.send(WorkerRequest::UpdateSpec(Arc::clone(&spec)))?;
+                worker_tx.send(render_range_for(current_row, visible_height, is_table, lookahead, total_rows))?;
+            }
+        }
+        Event::Key(key) => {
             // Help popup intercepts all keys
             if show_help {
                 show_help = false;
@@ -602,6 +617,8 @@ fn run_app(
 
             pending_count = None;
             worker_tx.send(render_range_for(current_row, visible_height, is_table, lookahead, total_rows))?;
+        }
+        _ => {}
         }
     }
 

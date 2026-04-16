@@ -84,6 +84,12 @@ impl RowCache {
         }
     }
 
+    pub fn clear(&self) {
+        if let Ok(mut cache) = self.inner.write() {
+            *cache = SizedLruCache::new(RENDERED_CACHE_BUDGET, RENDERED_CACHE_MIN_ITEMS);
+        }
+    }
+
     pub fn contains(&self, row: usize) -> bool {
         self.inner.read().ok().is_some_and(|c| c.contains(&row))
     }

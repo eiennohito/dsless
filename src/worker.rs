@@ -18,6 +18,8 @@ pub enum WorkerRequest {
         scan_from: usize,
         limit: usize,
     },
+    /// Terminal resized — adopt a new RenderSpec.
+    UpdateSpec(Arc<RenderSpec>),
     Shutdown,
 }
 
@@ -37,7 +39,7 @@ pub fn worker_thread(
     cache: Arc<RowCache>,
     rx: mpsc::Receiver<WorkerRequest>,
     tx: mpsc::Sender<WorkerResponse>,
-    spec: Arc<RenderSpec>,
+    mut spec: Arc<RenderSpec>,
 ) {
     let mut writer = LineWriter::new();
 
@@ -45,6 +47,9 @@ pub fn worker_thread(
         let req = drain_latest(req, &rx);
 
         match req {
+            WorkerRequest::UpdateSpec(new_spec) => {
+                spec = new_spec;
+            }
             WorkerRequest::RenderRange { start, end } => {
                 let end = end.min(source.total_rows());
                 for row in start..end {
@@ -143,7 +148,7 @@ fn render_range(
         } => {
             find_matching_records(source, cache, query, *scan_from, *limit, writer, spec, tx);
         }
-        WorkerRequest::Shutdown => {}
+        WorkerRequest::UpdateSpec(_) | WorkerRequest::Shutdown => {}
     }
 }
 
