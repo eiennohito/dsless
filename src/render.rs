@@ -147,6 +147,7 @@ impl RenderSpecNode {
                     col_widths,
                     col_order,
                     row_prefix,
+                    ..
                 } = &element.kind
                 {
                     let sa = values.as_any().downcast_ref::<StructArray>().unwrap();
