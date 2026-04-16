@@ -73,6 +73,7 @@ impl RowCache {
         }
     }
 
+    /// Write lock because LruCache::get promotes recency (needs &mut).
     pub fn get(&self, row: usize) -> Option<Arc<RenderedRow>> {
         self.inner.write().ok()?.get(&row).cloned()
     }
