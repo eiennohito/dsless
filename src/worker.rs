@@ -2,10 +2,11 @@ use std::fmt::Write;
 use std::sync::{Arc, mpsc};
 
 use arrow::array::*;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::DataType;
 
 use crate::cache::RowCache;
-use crate::render::{LayoutMode, LineWriter, RenderedRow, render_row, detect_layout, compute_table_layout};
+use crate::layout::RenderSpec;
+use crate::render::{LineWriter, RenderedRow};
 use crate::source::DataSource;
 
 pub enum WorkerRequest {
@@ -36,25 +37,11 @@ pub fn worker_thread(
     cache: Arc<RowCache>,
     rx: mpsc::Receiver<WorkerRequest>,
     tx: mpsc::Sender<WorkerResponse>,
-    terminal_width: u16,
+    spec: Arc<RenderSpec>,
 ) {
-    let schema = source.schema().clone();
-    let tw = terminal_width as usize;
-    let mut writer = LineWriter::new(tw);
+    let mut writer = LineWriter::new();
 
-    let layout = if detect_layout(&schema) {
-        let table = compute_table_layout(source.as_mut(), &schema, tw);
-        LayoutMode::Table(table)
-    } else {
-        LayoutMode::Vertical
-    };
-
-    loop {
-        let req = match rx.recv() {
-            Ok(r) => r,
-            Err(_) => break,
-        };
-
+    while let Ok(req) = rx.recv() {
         let req = drain_latest(req, &rx);
 
         match req {
@@ -65,14 +52,14 @@ pub fn worker_thread(
                         continue;
                     }
                     if let Ok(()) = source.ensure_loaded(row) {
-                        let rendered = render_one_row(&mut source, &schema, row, &mut writer, &layout);
+                        let rendered = render_one_row(&mut source, row, &mut writer, &spec);
                         cache.put(row, rendered);
                     }
 
                     if let Ok(newer) = rx.try_recv() {
                         let newer = drain_latest(newer, &rx);
                         render_range(
-                            &newer, &mut source, &cache, &schema, &mut writer, &layout, &tx,
+                            &newer, &mut source, &cache, &mut writer, &spec, &tx,
                         );
                         break;
                     }
@@ -87,12 +74,11 @@ pub fn worker_thread(
                 find_matching_records(
                     &mut source,
                     &cache,
-                    &schema,
                     &query,
                     scan_from,
                     limit,
                     &mut writer,
-                    &layout,
+                    &spec,
                     &tx,
                 );
             }
@@ -103,18 +89,17 @@ pub fn worker_thread(
 
 fn render_one_row(
     source: &mut Box<dyn DataSource>,
-    schema: &Arc<Schema>,
     global_row: usize,
     writer: &mut LineWriter,
-    layout: &LayoutMode,
+    spec: &RenderSpec,
 ) -> RenderedRow {
     writer.clear();
-    if matches!(layout, LayoutMode::Vertical) {
+    if !spec.is_table() {
         let _ = write!(writer, "── Row {} ──", global_row);
         writer.newline();
     }
     let (batch, local_row) = source.get_row(global_row);
-    render_row(batch, local_row, schema, writer, 1, layout);
+    spec.render_row(batch, local_row, writer);
     writer.finish()
 }
 
@@ -133,9 +118,8 @@ fn render_range(
     req: &WorkerRequest,
     source: &mut Box<dyn DataSource>,
     cache: &Arc<RowCache>,
-    schema: &Arc<Schema>,
     writer: &mut LineWriter,
-    layout: &LayoutMode,
+    spec: &RenderSpec,
     tx: &mpsc::Sender<WorkerResponse>,
 ) {
     match req {
@@ -146,7 +130,7 @@ fn render_range(
                     continue;
                 }
                 if let Ok(()) = source.ensure_loaded(row) {
-                    let rendered = render_one_row(source, schema, row, writer, layout);
+                    let rendered = render_one_row(source, row, writer, spec);
                     cache.put(row, rendered);
                 }
             }
@@ -157,7 +141,7 @@ fn render_range(
             scan_from,
             limit,
         } => {
-            find_matching_records(source, cache, schema, query, *scan_from, *limit, writer, layout, tx);
+            find_matching_records(source, cache, query, *scan_from, *limit, writer, spec, tx);
         }
         WorkerRequest::Shutdown => {}
     }
@@ -165,15 +149,15 @@ fn render_range(
 
 // --- Search: find matching records ---
 
+#[allow(clippy::too_many_arguments)]
 fn find_matching_records(
     source: &mut Box<dyn DataSource>,
     cache: &Arc<RowCache>,
-    schema: &Arc<Schema>,
     query: &str,
     scan_from: usize,
     limit: usize,
     writer: &mut LineWriter,
-    layout: &LayoutMode,
+    spec: &RenderSpec,
     tx: &mpsc::Sender<WorkerResponse>,
 ) {
     let query_lower = query.to_lowercase();
@@ -201,7 +185,7 @@ fn find_matching_records(
         }
 
         // Render and verify
-        let rendered = ensure_rendered(source, cache, schema, cursor, writer, layout);
+        let rendered = ensure_rendered(source, cache, cursor, writer, spec);
         let has_match = (0..rendered.line_count())
             .any(|i| rendered.line(i).to_lowercase().contains(&query_lower));
 
@@ -222,20 +206,18 @@ fn find_matching_records(
 fn ensure_rendered(
     source: &mut Box<dyn DataSource>,
     cache: &Arc<RowCache>,
-    schema: &Arc<Schema>,
     global_row: usize,
     writer: &mut LineWriter,
-    layout: &LayoutMode,
+    spec: &RenderSpec,
 ) -> Arc<RenderedRow> {
     if let Some(cached) = cache.get(global_row) {
         return cached;
     }
     let _ = source.ensure_loaded(global_row);
-    let rendered = render_one_row(source, schema, global_row, writer, layout);
-    let arc = Arc::new(rendered);
+    let rendered = render_one_row(source, global_row, writer, spec);
     // We don't cache search-rendered rows to avoid evicting nearby rows.
     // The RenderAround pass will cache them when the user navigates there.
-    arc
+    Arc::new(rendered)
 }
 
 // --- Parquet column matching ---

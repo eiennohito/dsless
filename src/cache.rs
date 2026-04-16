@@ -85,6 +85,6 @@ impl RowCache {
     }
 
     pub fn contains(&self, row: usize) -> bool {
-        self.inner.read().ok().map_or(false, |c| c.contains(&row))
+        self.inner.read().ok().is_some_and(|c| c.contains(&row))
     }
 }

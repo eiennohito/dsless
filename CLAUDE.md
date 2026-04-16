@@ -45,6 +45,12 @@ Evolution is data-driven. The system captures correct raw data; the logic that p
 ## Plans
 This project uses Github Issues for plan tracking. Create issues using `gh` tool. Never use per-project memory as it is local only.
 
+## Documentation
+> Agents start cold. Docs exist so session N+5 doesn't re-derive what session N already figured out.
+
+- **System docs** (`docs/`): High-level markdown covering *what* a subsystem does and *why* it exists. Implementation details belong in code; docs capture the reasoning that code can't express.
+- **Code comments**: Describe the *goal*, not the mechanism. "What this code does" should be obvious from reading it; if it isn't, the comment should state the high-level goal that justifies the complexity — not narrate the implementation. Code that is non-obvious *and* has no clear goal is a refactor target, not a comment target.
+
 ## Architecture
 
 See [docs](./docs/architecture.md)

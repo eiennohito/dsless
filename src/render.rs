@@ -2,110 +2,395 @@ use std::fmt::{self, Write};
 use std::sync::Arc;
 
 use arrow::array::*;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::DataType;
 
+use crate::layout::{RenderSpec, RenderSpecKind, RenderSpecNode};
 use crate::unicode::{display_width, truncate_to_width};
 
-// ============================================================
-// Layout mode
-// ============================================================
+impl RenderSpec {
+    /// Render one data row. Dispatches to table or vertical based on the spec.
+    pub fn render_row(&self, batch: &RecordBatch, row: usize, w: &mut LineWriter) {
+        self.root.render_row(batch, row, w, 1);
+    }
 
-/// How rows are rendered. Auto-detected now; will be configurable per schema later.
-pub enum LayoutMode {
-    /// One row per screen: field names on the left, values on the right.
-    Vertical,
-    /// Spreadsheet-style: one row per line, column headers at the top.
-    Table(TableColumnWidths),
+    pub fn render_table_header(&self) -> Vec<String> {
+        let RenderSpecKind::Struct {
+            children,
+            col_widths,
+            table_mode: true,
+            ..
+        } = &self.root.kind
+        else {
+            return Vec::new();
+        };
+
+        let mut header = String::new();
+        let mut separator = String::new();
+        for (ci, &cw) in col_widths.iter().enumerate() {
+            if ci > 0 {
+                header.push_str(" │ ");
+                separator.push_str("─┼─");
+            }
+            let name = &children[ci].0;
+            let w = display_width(name);
+            if w > cw {
+                let truncated = truncate_to_width(name, cw);
+                let tw = display_width(&truncated);
+                header.push_str(&truncated);
+                for _ in 0..cw.saturating_sub(tw) {
+                    header.push(' ');
+                }
+            } else {
+                header.push_str(name);
+                for _ in 0..cw.saturating_sub(w) {
+                    header.push(' ');
+                }
+            }
+            for _ in 0..cw {
+                separator.push('─');
+            }
+        }
+        vec![header, separator]
+    }
 }
 
-/// Pre-computed column widths for table layout.
-pub struct TableColumnWidths {
-    pub widths: Vec<usize>,
-}
-
-/// Detect layout from schema: table mode if all columns are scalar.
-pub fn detect_layout(schema: &Schema) -> bool {
-    schema.fields().iter().all(|f| is_scalar_type(f.data_type()))
-}
-
-/// Sample rows from batches to compute column widths for table layout.
-pub fn compute_table_layout(
-    source: &mut dyn crate::source::DataSource,
-    schema: &Schema,
-    terminal_width: usize,
-) -> TableColumnWidths {
-    let num_fields = schema.fields().len();
-    let sample_size = source.total_rows().min(200);
-
-    let mut scratch = String::new();
-    let mut all_widths: Vec<Vec<usize>> = vec![Vec::with_capacity(sample_size); num_fields];
-
-    for row in 0..sample_size {
-        let _ = source.ensure_loaded(row);
-        let (batch, local_row) = source.get_row(row);
-        for ci in 0..num_fields {
-            scratch.clear();
-            write_table_cell_value(&mut scratch, batch.column(ci).as_ref(), local_row);
-            all_widths[ci].push(display_width(&scratch));
+impl RenderSpecNode {
+    /// Render a top-level row. Dispatches to table or vertical based on spec.
+    fn render_row(&self, batch: &RecordBatch, row: usize, w: &mut LineWriter, depth: usize) {
+        match &self.kind {
+            RenderSpecKind::Struct {
+                table_mode: true,
+                col_widths,
+                col_order,
+                children,
+                ..
+            } => {
+                for (di, &cw) in col_widths.iter().enumerate() {
+                    if di > 0 {
+                        w.buf.push_str(" │ ");
+                    }
+                    let schema_idx = col_order[di];
+                    let col = batch.column(schema_idx);
+                    children[di].1.measure_cell(col.as_ref(), row, &mut w.scratch);
+                    w.write_cell_padded(cw);
+                }
+                w.newline();
+            }
+            RenderSpecKind::Struct {
+                table_mode: false,
+                col_order,
+                children,
+                ..
+            } => {
+                for (di, (name, child_spec)) in children.iter().enumerate() {
+                    let schema_idx = col_order[di];
+                    let col = batch.column(schema_idx);
+                    w.guide(depth);
+                    let _ = write!(w, "{}: ", name);
+                    child_spec.render_value(col.as_ref(), row, w, depth);
+                }
+            }
+            _ => unreachable!("root spec must be Struct"),
         }
     }
 
-    let mut natural_widths: Vec<usize> = Vec::with_capacity(num_fields);
-    for ci in 0..num_fields {
-        let widths = &mut all_widths[ci];
-        if widths.is_empty() {
-            natural_widths.push(1);
-            continue;
+    /// Expand a value across multiple lines with tree guides.
+    /// Each spec kind knows its own format: floats use precision,
+    /// strings use max_display, structs recurse into children.
+    fn render_value(&self, array: &dyn Array, row: usize, w: &mut LineWriter, depth: usize) {
+        if array.is_null(row) {
+            let _ = write!(w, "null");
+            w.newline();
+            return;
         }
-        widths.sort_unstable();
-        let p80_idx = (widths.len() * 4 / 5).min(widths.len().saturating_sub(1));
-        let p80 = widths[p80_idx];
-        let target = p80 + p80 / 10;
-        natural_widths.push(target.max(1));
+
+        match &self.kind {
+            RenderSpecKind::Scalar => {
+                write_scalar_to(&mut w.buf, array, row);
+                w.newline();
+            }
+            RenderSpecKind::Float {
+                precision,
+                exponential,
+            } => {
+                write_float_to(&mut w.buf, array, row, *precision, *exponential);
+                w.newline();
+            }
+            RenderSpecKind::Str { max_display } => {
+                write_string_verbose(&mut w.buf, array, row, *max_display);
+                w.newline();
+            }
+            RenderSpecKind::Struct {
+                children,
+                ..
+            } => {
+                let sa = array.as_any().downcast_ref::<StructArray>().unwrap();
+                w.newline();
+                for (ci, (name, child_spec)) in children.iter().enumerate() {
+                    let child = sa.column(ci);
+                    w.guide(depth + 1);
+                    let _ = write!(w, "{}: ", name);
+                    child_spec.render_value(child.as_ref(), row, w, depth + 1);
+                }
+            }
+            RenderSpecKind::List { element } => {
+                let (start, end, values) = list_offsets(array, row);
+                if start == end {
+                    let _ = write!(w, "[]");
+                    w.newline();
+                    return;
+                }
+                // List<Struct> with table_mode: render as nested table
+                if let RenderSpecKind::Struct {
+                    table_mode: true,
+                    children: child_specs,
+                    col_widths,
+                    col_order,
+                    row_prefix,
+                } = &element.kind
+                {
+                    let sa = values.as_any().downcast_ref::<StructArray>().unwrap();
+                    render_nested_table(sa, start, end, child_specs, col_widths, col_order, row_prefix, w);
+                    return;
+                }
+                // Scalar list: inline
+                if is_scalar_spec(&element.kind) {
+                    w.buf.push('[');
+                    for i in start..end {
+                        if i > start {
+                            w.buf.push_str(", ");
+                        }
+                        element.write_scalar_inline(&mut w.buf, values.as_ref(), i);
+                    }
+                    w.buf.push(']');
+                    w.newline();
+                } else {
+                    // Complex list: one item per line
+                    let _ = write!(w, "({} items)", end - start);
+                    w.newline();
+                    for i in start..end {
+                        w.guide(depth + 1);
+                        let _ = write!(w, "[{}]: ", i - start);
+                        element.render_value(values.as_ref(), i, w, depth + 1);
+                    }
+                }
+            }
+            RenderSpecKind::Map { key, value } => {
+                let ma = array.as_any().downcast_ref::<MapArray>().unwrap();
+                let offsets = ma.offsets();
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                let keys = ma.keys();
+                let vals = ma.values();
+
+                if start == end {
+                    let _ = write!(w, "{{}}");
+                    w.newline();
+                } else {
+                    w.newline();
+                    for i in start..end {
+                        w.guide(depth + 1);
+                        key.write_scalar_inline(&mut w.buf, keys.as_ref(), i);
+                        w.buf.push_str(": ");
+                        value.render_value(vals.as_ref(), i, w, depth + 1);
+                    }
+                }
+            }
+        }
     }
 
-    // Distribute: separators are " │ " (3 chars) between columns
-    let separators = if num_fields > 1 { (num_fields - 1) * 3 } else { 0 };
-    let available = terminal_width.saturating_sub(separators);
-    let widths = distribute_column_widths(&natural_widths, available);
+    fn measure_cell(&self, array: &dyn Array, row: usize, scratch: &mut String) {
+        scratch.clear();
+        self.write_cell_preview(scratch, array, row);
+    }
 
-    TableColumnWidths { widths }
+    /// Generate a compact inline representation for use inside table cells.
+    /// Produces enough content to fill the column; write_cell_padded truncates
+    /// to the actual column width. Strings are raw (no "...(N chars)" metadata).
+    pub(crate) fn write_cell_preview(&self, out: &mut String, array: &dyn Array, row: usize) {
+        if array.is_null(row) {
+            out.push_str("null");
+            return;
+        }
+        if out.len() > CELL_PREVIEW_BUDGET {
+            out.push('…');
+            return;
+        }
+
+        match &self.kind {
+            RenderSpecKind::Scalar => {
+                write_scalar_to(out, array, row);
+            }
+            RenderSpecKind::Float {
+                precision,
+                exponential,
+            } => {
+                write_float_to(out, array, row, *precision, *exponential);
+            }
+            RenderSpecKind::Str { .. } => {
+                write_string_raw(out, array, row);
+            }
+            RenderSpecKind::Struct { children, .. } => {
+                let sa = array.as_any().downcast_ref::<StructArray>().unwrap();
+                let total = children.len();
+                let preview_count = total.min(3);
+                out.push('{');
+                for (i, (name, child_spec)) in children.iter().enumerate().take(preview_count) {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{}: ", name);
+                    child_spec.write_cell_preview(out, sa.column(i).as_ref(), row);
+                    if out.len() > CELL_PREVIEW_BUDGET {
+                        break;
+                    }
+                }
+                if total > preview_count {
+                    let _ = write!(out, ", +{}", total - preview_count);
+                }
+                out.push('}');
+            }
+            RenderSpecKind::List { element } => {
+                let (s, e, values) = list_offsets(array, row);
+                let len = e - s;
+                if len == 0 {
+                    out.push_str("[]");
+                    return;
+                }
+                out.push('[');
+                let mut shown = 0;
+                for i in 0..len {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    if out.len() > CELL_PREVIEW_BUDGET {
+                        break;
+                    }
+                    element.write_cell_preview(out, values.as_ref(), s + i);
+                    shown += 1;
+                }
+                if shown < len {
+                    let _ = write!(out, ", +{}", len - shown);
+                }
+                out.push(']');
+            }
+            RenderSpecKind::Map { key, value } => {
+                let ma = array.as_any().downcast_ref::<MapArray>().unwrap();
+                let o = ma.offsets();
+                let start = o[row] as usize;
+                let end = o[row + 1] as usize;
+                let len = end - start;
+                if len == 0 {
+                    out.push_str("{}");
+                    return;
+                }
+                let keys = ma.keys();
+                let vals = ma.values();
+                out.push('{');
+                let mut shown = 0;
+                for i in 0..len {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    if out.len() > CELL_PREVIEW_BUDGET {
+                        let remaining = len - i;
+                        let _ = write!(out, "+{}", remaining);
+                        out.push('}');
+                        break;
+                    }
+                    key.write_cell_preview(out, keys.as_ref(), start + i);
+                    out.push_str(": ");
+                    value.write_cell_preview(out, vals.as_ref(), start + i);
+                    shown += 1;
+                }
+                if shown == len {
+                    out.push('}');
+                }
+            }
+        }
+    }
+
+    /// Write a scalar value inline (no newline). Used for scalar lists and map keys.
+    fn write_scalar_inline(&self, out: &mut String, array: &dyn Array, row: usize) {
+        match &self.kind {
+            RenderSpecKind::Float { precision, exponential } => {
+                write_float_to(out, array, row, *precision, *exponential);
+            }
+            RenderSpecKind::Str { .. } => {
+                write_string_raw(out, array, row);
+            }
+            _ => write_scalar_to(out, array, row),
+        }
+    }
 }
 
-/// Render the table header line (column names) for table layout.
-pub fn render_table_header(schema: &Schema, layout: &TableColumnWidths) -> Vec<String> {
-    let mut header = String::new();
-    let mut separator = String::new();
-    for (ci, &cw) in layout.widths.iter().enumerate() {
-        if ci > 0 {
-            header.push_str(" │ ");
-            separator.push_str("─┼─");
+#[allow(clippy::too_many_arguments)]
+fn render_nested_table(
+    sa: &StructArray,
+    start: usize,
+    end: usize,
+    child_specs: &[(String, RenderSpecNode)],
+    col_widths: &[usize],
+    col_order: &[usize],
+    row_prefix: &str,
+    w: &mut LineWriter,
+) {
+    let count = end - start;
+    if count == 0 {
+        let _ = write!(w, "[]");
+        w.newline();
+        return;
+    }
+
+    let _ = write!(w, "({} items)", count);
+    w.newline();
+
+    // Column headers
+    w.buf.push_str(row_prefix);
+    for (di, &cw) in col_widths.iter().enumerate() {
+        if di > 0 {
+            w.buf.push_str(" │ ");
         }
-        let name = schema.fields()[ci].name();
-        let w = display_width(name);
-        if w > cw {
-            header.push_str(&truncate_to_width(name, cw));
-            let tw = display_width(&truncate_to_width(name, cw));
-            for _ in 0..cw.saturating_sub(tw) {
-                header.push(' ');
-            }
-        } else {
-            header.push_str(name);
-            for _ in 0..cw.saturating_sub(w) {
-                header.push(' ');
-            }
+        w.write_padded(&child_specs[di].0, cw);
+    }
+    w.newline();
+
+    // Separator
+    w.buf.push_str(row_prefix);
+    for (di, &cw) in col_widths.iter().enumerate() {
+        if di > 0 {
+            w.buf.push_str("─┼─");
         }
         for _ in 0..cw {
-            separator.push('─');
+            w.buf.push('─');
         }
     }
-    vec![header, separator]
+    w.newline();
+
+    // Data rows
+    for row in start..end {
+        w.buf.push_str(row_prefix);
+        for (di, &cw) in col_widths.iter().enumerate() {
+            if di > 0 {
+                w.buf.push_str(" │ ");
+            }
+            let schema_idx = col_order[di];
+            let col = sa.column(schema_idx);
+            child_specs[di].1.measure_cell(col.as_ref(), row, &mut w.scratch);
+            w.write_cell_padded(cw);
+        }
+        w.newline();
+    }
 }
 
-// ============================================================
-// RenderedRow — immutable result stored in cache
-// ============================================================
+fn is_scalar_spec(kind: &RenderSpecKind) -> bool {
+    matches!(
+        kind,
+        RenderSpecKind::Scalar | RenderSpecKind::Float { .. } | RenderSpecKind::Str { .. }
+    )
+}
 
+/// Immutable rendered output for one data row. Stored in cache.
 pub struct RenderedRow {
     buf: String,
     line_starts: Vec<usize>,
@@ -119,7 +404,6 @@ impl RenderedRow {
     pub fn line(&self, idx: usize) -> &str {
         let start = self.line_starts[idx];
         let end = if idx + 1 < self.line_starts.len() {
-            // line_starts[i+1] points past the '\n' of line i
             self.line_starts[idx + 1] - 1
         } else {
             self.buf.len()
@@ -156,35 +440,26 @@ impl<'a> Iterator for LineIter<'a> {
     }
 }
 
-// ============================================================
-// LineWriter — reusable buffer for rendering
-// ============================================================
-
-/// Pre-computed guide string. Max depth 32 should be plenty.
 const MAX_GUIDE_DEPTH: usize = 32;
 
 fn guide_str() -> &'static str {
-    // "│ " repeated MAX_GUIDE_DEPTH times
-    // Each "│ " is 4 bytes (│ = 3 bytes UTF-8 + 1 space)
     static GUIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     GUIDE.get_or_init(|| "│ ".repeat(MAX_GUIDE_DEPTH))
 }
 
+/// Reusable buffer that accumulates rendered output with zero per-line allocation.
 pub struct LineWriter {
-    buf: String,
+    pub(crate) buf: String,
     line_starts: Vec<usize>,
-    scratch: String,
-    /// Terminal width in display columns. Used for smart column sizing.
-    terminal_width: usize,
+    pub(crate) scratch: String,
 }
 
 impl LineWriter {
-    pub fn new(terminal_width: usize) -> Self {
+    pub fn new() -> Self {
         LineWriter {
             buf: String::new(),
             line_starts: vec![0],
             scratch: String::new(),
-            terminal_width,
         }
     }
 
@@ -194,22 +469,18 @@ impl LineWriter {
         self.line_starts.push(0);
     }
 
-    /// End the current line.
     pub fn newline(&mut self) {
         self.buf.push('\n');
         self.line_starts.push(self.buf.len());
     }
 
-    /// Write guide characters for the given depth. No allocation.
     pub fn guide(&mut self, depth: usize) {
         let g = guide_str();
         let byte_len = depth.min(MAX_GUIDE_DEPTH) * "│ ".len();
         self.buf.push_str(&g[..byte_len]);
     }
 
-    /// Clone out the result. 2 allocations (buf + line_starts).
     pub fn finish(&self) -> RenderedRow {
-        // Remove trailing empty line if present
         let mut line_starts = self.line_starts.clone();
         if line_starts.len() > 1 && *line_starts.last().unwrap() == self.buf.len() {
             line_starts.pop();
@@ -220,21 +491,12 @@ impl LineWriter {
         }
     }
 
-    /// Write a table cell value into scratch, return its display width.
-    fn measure_cell(&mut self, array: &dyn Array, row: usize) -> usize {
-        self.scratch.clear();
-        write_table_cell_value(&mut self.scratch, array, row);
-        display_width(&self.scratch)
-    }
-
-    /// Write the scratch content (last measured cell) padded/truncated to `width`.
     fn write_cell_padded(&mut self, width: usize) {
         let vw = display_width(&self.scratch);
         if vw > width {
             let truncated = truncate_to_width(&self.scratch, width);
             let tw = display_width(&truncated);
             self.buf.push_str(&truncated);
-            // Pad remainder — CJK chars (width 2) can leave a 1-column gap
             for _ in 0..width.saturating_sub(tw) {
                 self.buf.push(' ');
             }
@@ -246,7 +508,6 @@ impl LineWriter {
         }
     }
 
-    /// Write a string padded to `width` display columns. No allocation.
     fn write_padded(&mut self, s: &str, width: usize) {
         let w = display_width(s);
         self.buf.push_str(s);
@@ -263,421 +524,82 @@ impl fmt::Write for LineWriter {
     }
 }
 
-// ============================================================
-// Rendering API
-// ============================================================
+/// Max bytes to generate for a cell preview before bailing out.
+/// Prevents runaway string generation for huge maps/lists.
+/// Column truncation (write_cell_padded) handles the visual cut.
+const CELL_PREVIEW_BUDGET: usize = 512;
 
-pub fn render_row(
-    batch: &RecordBatch,
-    row: usize,
-    schema: &Arc<Schema>,
-    w: &mut LineWriter,
-    depth: usize,
-    layout: &LayoutMode,
-) {
-    match layout {
-        LayoutMode::Vertical => {
-            for (col_idx, field) in schema.fields().iter().enumerate() {
-                let col = batch.column(col_idx);
-                w.guide(depth);
-                let _ = write!(w, "{}: ", field.name());
-                render_value(col, row, w, depth);
-            }
-        }
-        LayoutMode::Table(table) => {
-            for (ci, &cw) in table.widths.iter().enumerate() {
-                if ci > 0 {
-                    w.buf.push_str(" │ ");
-                }
-                let col = batch.column(ci);
-                w.measure_cell(col.as_ref(), row);
-                w.write_cell_padded(cw);
-            }
-            w.newline();
-        }
-    }
-}
-
-fn render_value(array: &dyn Array, row: usize, w: &mut LineWriter, depth: usize) {
-    if array.is_null(row) {
-        let _ = write!(w, "null");
-        w.newline();
-        return;
-    }
-
-    match array.data_type() {
-        DataType::Struct(_) => {
-            let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
-            w.newline();
-            for (i, field) in struct_array.fields().iter().enumerate() {
-                let child = struct_array.column(i);
-                w.guide(depth + 1);
-                let _ = write!(w, "{}: ", field.name());
-                render_value(child.as_ref(), row, w, depth + 1);
-            }
-        }
-        DataType::List(field) | DataType::LargeList(field)
-            if matches!(field.data_type(), DataType::Struct(_)) =>
-        {
-            let (start, end, values) = list_offsets(array, row);
-            let struct_array = values.as_any().downcast_ref::<StructArray>().unwrap();
-            render_struct_list_as_table(struct_array, start, end, w, depth);
-        }
-        dt if is_scalar_list(dt) => {
-            let (start, end, values) = list_offsets(array, row);
-            if start == end {
-                let _ = write!(w, "[]");
-            } else {
-                w.buf.push('[');
-                for i in start..end {
-                    if i > start {
-                        w.buf.push_str(", ");
-                    }
-                    write_scalar_to(w, values.as_ref(), i);
-                }
-                w.buf.push(']');
-            }
-            w.newline();
-        }
-        DataType::List(_) | DataType::LargeList(_) => {
-            let (start, end, values) = list_offsets(array, row);
-            if start == end {
-                let _ = write!(w, "[]");
-                w.newline();
-            } else {
-                let _ = write!(w, "({} items)", end - start);
-                w.newline();
-                for i in start..end {
-                    w.guide(depth + 1);
-                    let _ = write!(w, "[{}]: ", i - start);
-                    render_value(values.as_ref(), i, w, depth + 1);
-                }
-            }
-        }
-        DataType::Map(_, _) => {
-            let map_array = array.as_any().downcast_ref::<MapArray>().unwrap();
-            let offsets = map_array.offsets();
-            let start = offsets[row] as usize;
-            let end = offsets[row + 1] as usize;
-            let keys = map_array.keys();
-            let values = map_array.values();
-
-            if start == end {
-                let _ = write!(w, "{{}}");
-                w.newline();
-            } else {
-                w.newline();
-                for i in start..end {
-                    w.guide(depth + 1);
-                    write_scalar_to(w, keys.as_ref(), i);
-                    w.buf.push_str(": ");
-                    render_value(values.as_ref(), i, w, depth + 1);
-                }
-            }
-        }
-        _ => {
-            write_scalar_to(w, array, row);
-            w.newline();
-        }
-    }
-}
-
-// ============================================================
-// Table layout for list-of-struct
-// ============================================================
-
-fn render_struct_list_as_table(
-    struct_array: &StructArray,
-    start: usize,
-    end: usize,
-    w: &mut LineWriter,
-    depth: usize,
-) {
-    let count = end - start;
-    if count == 0 {
-        let _ = write!(w, "[]");
-        w.newline();
-        return;
-    }
-
-    let num_fields = struct_array.num_columns();
-
-    // Pass 1: measure column widths using ~80th percentile
-    let num_rows = end - start;
-    let mut natural_widths: Vec<usize> = Vec::with_capacity(num_fields);
-    for ci in 0..num_fields {
-        let header_w = display_width(struct_array.fields()[ci].name());
-        let col = struct_array.column(ci);
-        let mut widths: Vec<usize> = Vec::with_capacity(num_rows);
-        for row in start..end {
-            widths.push(w.measure_cell(col.as_ref(), row));
-        }
-        widths.sort_unstable();
-        // p80 index, +10% padding, but at least header width
-        let p80_idx = (num_rows * 4 / 5).min(num_rows.saturating_sub(1));
-        let p80 = widths[p80_idx];
-        let target = p80 + p80 / 10; // +10% headroom
-        natural_widths.push(target.max(header_w));
-    }
-
-    // Pass 1b: distribute available width smartly across columns
-    // Available = terminal_width - guide indent - left padding - separators
-    let guide_width = (depth + 1) * 2; // "│ " per depth level
-    let left_pad = 2; // "  " before first column
-    let separators = if num_fields > 1 { (num_fields - 1) * 3 } else { 0 }; // " │ "
-    let overhead = guide_width + left_pad + separators;
-    let available = w.terminal_width.saturating_sub(overhead);
-    let col_widths = distribute_column_widths(&natural_widths, available);
-
-    // Header: "(N items)"
-    let _ = write!(w, "({} items)", count);
-    w.newline();
-
-    // Column headers
-    w.guide(depth + 1);
-    w.buf.push_str("  ");
-    for (c, &cw) in col_widths.iter().enumerate() {
-        if c > 0 {
-            w.buf.push_str(" │ ");
-        }
-        w.write_padded(struct_array.fields()[c].name(), cw);
-    }
-    w.newline();
-
-    // Separator
-    w.guide(depth + 1);
-    w.buf.push_str("  ");
-    for (c, &cw) in col_widths.iter().enumerate() {
-        if c > 0 {
-            w.buf.push_str("─┼─");
-        }
-        for _ in 0..cw {
-            w.buf.push('─');
-        }
-    }
-    w.newline();
-
-    // Data rows — pass 2: format each cell into scratch, write padded to buf
-    for row in start..end {
-        w.guide(depth + 1);
-        w.buf.push_str("  ");
-        for (ci, &cw) in col_widths.iter().enumerate() {
-            if ci > 0 {
-                w.buf.push_str(" │ ");
-            }
-            let col = struct_array.column(ci);
-            w.measure_cell(col.as_ref(), row); // formats into scratch
-            w.write_cell_padded(cw); // writes scratch content padded to buf
-        }
-        w.newline();
-    }
-}
-
-/// Distribute `available` width across columns.
-/// Columns that fit naturally get their natural width.
-/// Remaining space is split evenly among columns that need more.
-fn distribute_column_widths(natural: &[usize], available: usize) -> Vec<usize> {
-    let num = natural.len();
-    if num == 0 {
-        return vec![];
-    }
-
-    // Minimum useful width per column
-    const MIN_COL: usize = 8;
-
-    let total_natural: usize = natural.iter().sum();
-    if total_natural <= available {
-        // Everything fits — use natural widths
-        return natural.to_vec();
-    }
-
-    // Iterative allocation: give small columns their natural width,
-    // split the rest among overflowing columns.
-    let mut allocated = vec![0usize; num];
-    let mut settled = vec![false; num];
-    let mut remaining = available;
-
-    loop {
-        let unsettled: usize = settled.iter().filter(|&&s| !s).count();
-        if unsettled == 0 {
-            break;
-        }
-        let fair_share = remaining / unsettled;
-
-        let mut changed = false;
-        for i in 0..num {
-            if settled[i] {
-                continue;
-            }
-            if natural[i] <= fair_share {
-                // This column fits in its fair share — give it natural width
-                allocated[i] = natural[i];
-                settled[i] = true;
-                remaining -= natural[i];
-                changed = true;
-            }
-        }
-
-        if !changed {
-            // No column settled — all remaining columns are wider than fair share.
-            // Split remaining space evenly.
-            let unsettled_indices: Vec<usize> = (0..num).filter(|&i| !settled[i]).collect();
-            let share = remaining / unsettled_indices.len().max(1);
-            let mut leftover = remaining % unsettled_indices.len().max(1);
-            for &i in &unsettled_indices {
-                let w = share + if leftover > 0 { leftover -= 1; 1 } else { 0 };
-                allocated[i] = w.max(MIN_COL);
-                settled[i] = true;
-            }
-            break;
-        }
-    }
-
-    allocated
-}
-
-// ============================================================
-// Table cell preview (writes to any fmt::Write target)
-// ============================================================
-
-fn write_table_cell_value(out: &mut String, array: &dyn Array, row: usize) {
+fn write_float_to(out: &mut String, array: &dyn Array, row: usize, precision: u8, exponential: bool) {
     if array.is_null(row) {
         out.push_str("null");
         return;
     }
-    match array.data_type() {
-        DataType::Struct(_) => {
-            let sa = array.as_any().downcast_ref::<StructArray>().unwrap();
-            let fields = sa.fields();
-            let total = fields.len();
-            let preview_count = total.min(3);
-            out.push('{');
-            for i in 0..preview_count {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                let _ = write!(out, "{}: ", fields[i].name());
-                write_table_cell_value(out, sa.column(i).as_ref(), row);
-            }
-            if total > preview_count {
-                let _ = write!(out, ", +{}", total - preview_count);
-            }
-            out.push('}');
-        }
-        DataType::List(_) | DataType::LargeList(_) => {
-            let (s, e, values) = list_offsets(array, row);
-            let len = e - s;
-            if len == 0 {
-                out.push_str("[]");
-                return;
-            }
-            if is_scalar_list(array.data_type()) {
-                let preview_count = len.min(3);
-                out.push('[');
-                for i in 0..preview_count {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    write_scalar_to_string(out, values.as_ref(), s + i);
-                }
-                if len > preview_count {
-                    let _ = write!(out, ", +{}", len - preview_count);
-                }
-                out.push(']');
-            } else {
-                out.push('[');
-                write_table_cell_value(out, values.as_ref(), s);
-                if len > 1 {
-                    let _ = write!(out, ", +{}", len - 1);
-                }
-                out.push(']');
-            }
-        }
-        DataType::Map(_, _) => {
-            let ma = array.as_any().downcast_ref::<MapArray>().unwrap();
-            let o = ma.offsets();
-            let start = o[row] as usize;
-            let end = o[row + 1] as usize;
-            let len = end - start;
-            if len == 0 {
-                out.push_str("{}");
-            } else {
-                let keys = ma.keys();
-                let values = ma.values();
-                out.push('{');
-                // Write key: value pairs until we've produced enough text.
-                // Downstream truncation handles the final cut, but we avoid
-                // generating megabytes for huge maps.
-                const MAX_PREVIEW_WIDTH: usize = 300;
-                let mut shown = 0;
-                for i in 0..len {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    if display_width(out.as_str()) > MAX_PREVIEW_WIDTH {
-                        let remaining = len - i;
-                        let _ = write!(out, "+{}", remaining);
-                        break;
-                    }
-                    write_scalar_to_string(out, keys.as_ref(), start + i);
-                    out.push_str(": ");
-                    write_scalar_to_string(out, values.as_ref(), start + i);
-                    shown += 1;
-                }
-                if shown == len {
-                    out.push('}');
-                }
-            }
-        }
-        _ => write_scalar_to_string(out, array, row),
+    let v = crate::layout::extract_float(array, row);
+    if !v.is_finite() {
+        write_scalar_to(out, array, row);
+        return;
+    }
+    if exponential {
+        let _ = write!(out, "{:.prec$e}", v, prec = precision as usize);
+    } else {
+        let _ = write!(out, "{:.prec$}", v, prec = precision as usize);
     }
 }
 
-// ============================================================
-// Helpers
-// ============================================================
-
-fn is_scalar_type(dt: &DataType) -> bool {
-    !matches!(
-        dt,
-        DataType::Struct(_) | DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _)
-    )
-}
-
-fn is_scalar_list(dt: &DataType) -> bool {
-    match dt {
-        DataType::List(field) | DataType::LargeList(field) => is_scalar_type(field.data_type()),
-        _ => false,
+/// Truncate long strings with a "(N chars)" hint. For vertical mode where
+/// the user is looking at one value and wants to know how much was cut.
+fn write_string_verbose(out: &mut String, array: &dyn Array, row: usize, max_display: usize) {
+    if array.is_null(row) {
+        out.push_str("null");
+        return;
+    }
+    let s = extract_str(array, row);
+    let w = display_width(s);
+    if w > max_display {
+        out.push('"');
+        let mut current_width = 0;
+        for c in s.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if current_width + cw > max_display {
+                break;
+            }
+            out.push(c);
+            current_width += cw;
+        }
+        let _ = write!(out, "...\" ({} chars)", s.chars().count());
+    } else {
+        out.push('"');
+        out.push_str(s);
+        out.push('"');
     }
 }
 
-fn list_offsets(array: &dyn Array, row: usize) -> (usize, usize, Arc<dyn Array>) {
-    match array.data_type() {
-        DataType::List(_) => {
-            let la = array.as_any().downcast_ref::<ListArray>().unwrap();
-            let o = la.offsets();
-            (o[row] as usize, o[row + 1] as usize, la.values().clone())
-        }
-        DataType::LargeList(_) => {
-            let la = array.as_any().downcast_ref::<LargeListArray>().unwrap();
-            let o = la.offsets();
-            (o[row] as usize, o[row + 1] as usize, la.values().clone())
-        }
-        _ => unreachable!(),
+/// Quoted string with no truncation. For cell previews where the column
+/// width handles the visual cut — we don't want "(N chars)" noise in a
+/// map key or list element.
+fn write_string_raw(out: &mut String, array: &dyn Array, row: usize) {
+    if array.is_null(row) {
+        out.push_str("null");
+        return;
+    }
+    let s = extract_str(array, row);
+    out.push('"');
+    out.push_str(s);
+    out.push('"');
+}
+
+pub(crate) fn extract_str(array: &dyn Array, row: usize) -> &str {
+    if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        a.value(row)
+    } else if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        a.value(row)
+    } else {
+        ""
     }
 }
 
-// ============================================================
-// Scalar formatting — write directly to a target, no alloc
-// ============================================================
-
-/// Write a scalar value directly into LineWriter's buf.
-fn write_scalar_to(w: &mut LineWriter, array: &dyn Array, row: usize) {
-    write_scalar_to_string(&mut w.buf, array, row);
-}
-
-/// Write a scalar value into any String buffer.
-fn write_scalar_to_string(out: &mut String, array: &dyn Array, row: usize) {
+/// Write a scalar value into a buffer. Used by spec methods and layout sampling.
+pub(crate) fn write_scalar_to(out: &mut String, array: &dyn Array, row: usize) {
     if array.is_null(row) {
         out.push_str("null");
         return;
@@ -714,11 +636,15 @@ fn write_scalar_to_string(out: &mut String, array: &dyn Array, row: usize) {
     match array.data_type() {
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-            write_string_value(out, arr.value(row));
+            out.push('"');
+            out.push_str(arr.value(row));
+            out.push('"');
         }
         DataType::LargeUtf8 => {
             let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            write_string_value(out, arr.value(row));
+            out.push('"');
+            out.push_str(arr.value(row));
+            out.push('"');
         }
         DataType::Boolean => {
             let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -749,24 +675,18 @@ fn write_scalar_to_string(out: &mut String, array: &dyn Array, row: usize) {
     }
 }
 
-fn write_string_value(out: &mut String, s: &str) {
-    const MAX_DISPLAY_WIDTH: usize = 200;
-    let w = display_width(s);
-    if w > MAX_DISPLAY_WIDTH {
-        out.push('"');
-        let mut current_width = 0;
-        for c in s.chars() {
-            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if current_width + cw > MAX_DISPLAY_WIDTH {
-                break;
-            }
-            out.push(c);
-            current_width += cw;
+pub(crate) fn list_offsets(array: &dyn Array, row: usize) -> (usize, usize, Arc<dyn Array>) {
+    match array.data_type() {
+        DataType::List(_) => {
+            let la = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let o = la.offsets();
+            (o[row] as usize, o[row + 1] as usize, la.values().clone())
         }
-        let _ = write!(out, "...\" ({} chars)", s.chars().count());
-    } else {
-        out.push('"');
-        out.push_str(s);
-        out.push('"');
+        DataType::LargeList(_) => {
+            let la = array.as_any().downcast_ref::<LargeListArray>().unwrap();
+            let o = la.offsets();
+            (o[row] as usize, o[row + 1] as usize, la.values().clone())
+        }
+        _ => unreachable!(),
     }
 }

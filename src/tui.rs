@@ -8,6 +8,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::cache::RowCache;
+use crate::layout::{Layout, RenderSpec};
 use crate::source::DataSource;
 use crate::worker::{WorkerRequest, WorkerResponse, worker_thread};
 
@@ -133,19 +134,14 @@ fn run_app(
 ) -> Result<()> {
     let total_rows = source.total_rows();
     let terminal_width = terminal.size()?.width as usize;
-    let schema = source.schema().clone();
 
-    // Detect layout mode and build header
-    let is_table = crate::render::detect_layout(&schema);
-    let table_header: Vec<String> = if is_table {
-        let layout = crate::render::compute_table_layout(source.as_mut(), &schema, terminal_width);
-        crate::render::render_table_header(&schema, &layout)
-    } else {
-        Vec::new()
-    };
+    // Compute Layout (single source of truth) and resolve RenderSpec
+    let layout = Layout::compute(source.as_mut());
+    let spec = Arc::new(RenderSpec::resolve(&layout, terminal_width));
+    let is_table = spec.is_table();
+
     let schema_header = if is_table {
-        // For table layout, use column headers instead of schema dump
-        table_header
+        spec.render_table_header()
     } else {
         build_schema_header(source.as_ref())
     };
@@ -156,9 +152,9 @@ fn run_app(
     let (response_tx, response_rx) = mpsc::channel();
 
     let cache_clone = Arc::clone(&cache);
-    let tw = terminal_width as u16;
+    let spec_clone = Arc::clone(&spec);
     let worker_handle = thread::spawn(move || {
-        worker_thread(source, cache_clone, worker_rx, response_tx, tw);
+        worker_thread(source, cache_clone, worker_rx, response_tx, spec_clone);
     });
 
     // Lookahead margin: extra rows beyond visible to pre-render for smooth scrolling.
@@ -220,21 +216,21 @@ fn run_app(
                         s.scan_cursor = scanned_up_to;
 
                         // On first batch, navigate to first match
-                        if first_batch {
-                            if let Some(&row) = s.matched_rows.first() {
-                                s.current_idx = 0;
-                                let vh = terminal.size()?.height.saturating_sub(3) as usize;
-                                navigate_to_match(
-                                    &cache,
-                                    s,
-                                    row,
-                                    &mut current_row,
-                                    &mut line_offset,
-                                    vh,
-                                );
-                                show_header = false;
-                                worker_tx.send(render_range_for(row, vh, is_table, lookahead, total_rows))?;
-                            }
+                        if first_batch
+                            && let Some(&row) = s.matched_rows.first()
+                        {
+                            s.current_idx = 0;
+                            let vh = terminal.size()?.height.saturating_sub(3) as usize;
+                            navigate_to_match(
+                                &cache,
+                                s,
+                                row,
+                                &mut current_row,
+                                &mut line_offset,
+                                vh,
+                            );
+                            show_header = false;
+                            worker_tx.send(render_range_for(row, vh, is_table, lookahead, total_rows))?;
                         }
                     }
                 }
@@ -696,7 +692,7 @@ fn style_line<'a>(line: &str, row: usize, search: &Option<SearchState>) -> Line<
     // Check if this row is a search match
     let is_match_row = search
         .as_ref()
-        .map_or(false, |s| s.matched_rows.contains(&row));
+        .is_some_and(|s| s.matched_rows.contains(&row));
 
     if line.starts_with("── Row") {
         let style = if is_match_row {
@@ -712,7 +708,7 @@ fn style_line<'a>(line: &str, row: usize, search: &Option<SearchState>) -> Line<
     } else if is_match_row
         && search
             .as_ref()
-            .map_or(false, |s| {
+            .is_some_and(|s| {
                 let q = s.query.to_lowercase();
                 line.to_lowercase().contains(&q)
             })

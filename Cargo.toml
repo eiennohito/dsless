@@ -13,3 +13,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 unicode-width = "0.2"
 lru = "0.16"
+ryu = "1.0.23"
