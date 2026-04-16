@@ -129,23 +129,60 @@ fn build_schema_header(source: &dyn DataSource) -> Vec<String> {
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    source: Box<dyn DataSource>,
+    mut source: Box<dyn DataSource>,
 ) -> Result<()> {
     let total_rows = source.total_rows();
-    let schema_header = build_schema_header(source.as_ref());
+    let terminal_width = terminal.size()?.width as usize;
+    let schema = source.schema().clone();
+
+    // Detect layout mode and build header
+    let is_table = crate::render::detect_layout(&schema);
+    let table_header: Vec<String> = if is_table {
+        let layout = crate::render::compute_table_layout(source.as_mut(), &schema, terminal_width);
+        crate::render::render_table_header(&schema, &layout)
+    } else {
+        Vec::new()
+    };
+    let schema_header = if is_table {
+        // For table layout, use column headers instead of schema dump
+        table_header
+    } else {
+        build_schema_header(source.as_ref())
+    };
 
     let cache = Arc::new(RowCache::new());
 
     let (worker_tx, worker_rx) = mpsc::channel();
     let (response_tx, response_rx) = mpsc::channel();
 
-    let terminal_width = terminal.size()?.width;
     let cache_clone = Arc::clone(&cache);
+    let tw = terminal_width as u16;
     let worker_handle = thread::spawn(move || {
-        worker_thread(source, cache_clone, worker_rx, response_tx, terminal_width);
+        worker_thread(source, cache_clone, worker_rx, response_tx, tw);
     });
 
-    worker_tx.send(WorkerRequest::RenderAround(0))?;
+    // Lookahead margin: extra rows beyond visible to pre-render for smooth scrolling.
+    // In table mode (1 line/row), we need more rows; in vertical mode fewer.
+    let lookahead = if is_table { 20 } else { 5 };
+
+    /// Build a render range: from `start` row, covering enough rows for the screen + margin.
+    /// For table mode each row = 1 line so we need ~visible_height rows.
+    /// For vertical mode each row = many lines so fewer rows suffice.
+    fn render_range_for(start: usize, visible_height: usize, is_table: bool, lookahead: usize, total: usize) -> WorkerRequest {
+        let rows_needed = if is_table {
+            visible_height + lookahead
+        } else {
+            // Assume ~10 lines per row in vertical mode; overshoot is fine (cached rows are skipped)
+            visible_height / 5 + lookahead
+        };
+        WorkerRequest::RenderRange {
+            start,
+            end: (start + rows_needed).min(total),
+        }
+    }
+
+    let initial_height = terminal.size()?.height.saturating_sub(3) as usize;
+    worker_tx.send(render_range_for(0, initial_height, is_table, lookahead, total_rows))?;
 
     let mut current_row: usize = 0;
     let mut line_offset: usize = 0;
@@ -186,16 +223,17 @@ fn run_app(
                         if first_batch {
                             if let Some(&row) = s.matched_rows.first() {
                                 s.current_idx = 0;
+                                let vh = terminal.size()?.height.saturating_sub(3) as usize;
                                 navigate_to_match(
                                     &cache,
                                     s,
                                     row,
                                     &mut current_row,
                                     &mut line_offset,
-                                    terminal.size()?.height.saturating_sub(3) as usize,
+                                    vh,
                                 );
                                 show_header = false;
-                                worker_tx.send(WorkerRequest::RenderAround(row))?;
+                                worker_tx.send(render_range_for(row, vh, is_table, lookahead, total_rows))?;
                             }
                         }
                     }
@@ -215,7 +253,9 @@ fn run_app(
             let mut display: Vec<Line> = Vec::with_capacity(visible_height);
             let mut lines_remaining = visible_height;
 
-            if show_header && current_row == 0 && line_offset == 0 {
+            // Table layout: always show column headers (sticky)
+            // Vertical layout: show schema header only at top
+            if is_table || (show_header && current_row == 0 && line_offset == 0) {
                 for hline in &schema_header {
                     if lines_remaining == 0 {
                         break;
@@ -311,13 +351,19 @@ fn run_app(
             }
         })?;
 
-        // If the draw had cache misses, re-request rendering so the
-        // worker fills in the missing rows.
-        if draw_had_cache_miss {
-            worker_tx.send(WorkerRequest::RenderAround(current_row))?;
-        }
-
         let visible_height = terminal.size()?.height.saturating_sub(3) as usize;
+
+        // If the draw had cache misses, request the visible range + lookahead.
+        if draw_had_cache_miss {
+            // last_visible_row is the furthest row the draw loop tried to show.
+            // Request from current_row to beyond last_visible_row so the worker
+            // covers all missing rows.
+            let end = last_visible_row + 1 + lookahead;
+            worker_tx.send(WorkerRequest::RenderRange {
+                start: current_row,
+                end: end.min(total_rows),
+            })?;
+        }
 
         if !event::poll(Duration::from_millis(50))? {
             continue;
@@ -436,7 +482,7 @@ fn run_app(
                             current_row = target;
                             line_offset = 0;
                             show_header = target == 0;
-                            worker_tx.send(WorkerRequest::RenderAround(target))?;
+                            worker_tx.send(render_range_for(target, visible_height, is_table, lookahead, total_rows))?;
                         }
                         None => {
                             if line_offset == 0 && current_row > 0 {
@@ -454,7 +500,7 @@ fn run_app(
                             current_row = target;
                             line_offset = 0;
                             show_header = target == 0;
-                            worker_tx.send(WorkerRequest::RenderAround(target))?;
+                            worker_tx.send(render_range_for(target, visible_height, is_table, lookahead, total_rows))?;
                         }
                         None => {
                             if current_row + 1 < total_rows {
@@ -478,7 +524,7 @@ fn run_app(
                         current_row = target;
                         line_offset = 0;
                         show_header = target == 0;
-                        worker_tx.send(WorkerRequest::RenderAround(target))?;
+                        worker_tx.send(render_range_for(target, visible_height, is_table, lookahead, total_rows))?;
                     }
                 }
 
@@ -513,7 +559,7 @@ fn run_app(
                                 visible_height,
                             );
                             show_header = false;
-                            worker_tx.send(WorkerRequest::RenderAround(row))?;
+                            worker_tx.send(render_range_for(row, visible_height, is_table, lookahead, total_rows))?;
                         } else if !s.exhausted {
                             // Need more matches from worker
                             searching = true;
@@ -540,7 +586,7 @@ fn run_app(
                                 visible_height,
                             );
                             show_header = current_row == 0;
-                            worker_tx.send(WorkerRequest::RenderAround(row))?;
+                            worker_tx.send(render_range_for(row, visible_height, is_table, lookahead, total_rows))?;
                         }
                     }
                 }
@@ -559,7 +605,7 @@ fn run_app(
             }
 
             pending_count = None;
-            worker_tx.send(WorkerRequest::RenderAround(current_row))?;
+            worker_tx.send(render_range_for(current_row, visible_height, is_table, lookahead, total_rows))?;
         }
     }
 

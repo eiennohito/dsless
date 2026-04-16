@@ -7,6 +7,102 @@ use arrow::datatypes::{DataType, Schema};
 use crate::unicode::{display_width, truncate_to_width};
 
 // ============================================================
+// Layout mode
+// ============================================================
+
+/// How rows are rendered. Auto-detected now; will be configurable per schema later.
+pub enum LayoutMode {
+    /// One row per screen: field names on the left, values on the right.
+    Vertical,
+    /// Spreadsheet-style: one row per line, column headers at the top.
+    Table(TableColumnWidths),
+}
+
+/// Pre-computed column widths for table layout.
+pub struct TableColumnWidths {
+    pub widths: Vec<usize>,
+}
+
+/// Detect layout from schema: table mode if all columns are scalar.
+pub fn detect_layout(schema: &Schema) -> bool {
+    schema.fields().iter().all(|f| is_scalar_type(f.data_type()))
+}
+
+/// Sample rows from batches to compute column widths for table layout.
+pub fn compute_table_layout(
+    source: &mut dyn crate::source::DataSource,
+    schema: &Schema,
+    terminal_width: usize,
+) -> TableColumnWidths {
+    let num_fields = schema.fields().len();
+    let sample_size = source.total_rows().min(200);
+
+    let mut scratch = String::new();
+    let mut all_widths: Vec<Vec<usize>> = vec![Vec::with_capacity(sample_size); num_fields];
+
+    for row in 0..sample_size {
+        let _ = source.ensure_loaded(row);
+        let (batch, local_row) = source.get_row(row);
+        for ci in 0..num_fields {
+            scratch.clear();
+            write_table_cell_value(&mut scratch, batch.column(ci).as_ref(), local_row);
+            all_widths[ci].push(display_width(&scratch));
+        }
+    }
+
+    let mut natural_widths: Vec<usize> = Vec::with_capacity(num_fields);
+    for ci in 0..num_fields {
+        let widths = &mut all_widths[ci];
+        if widths.is_empty() {
+            natural_widths.push(1);
+            continue;
+        }
+        widths.sort_unstable();
+        let p80_idx = (widths.len() * 4 / 5).min(widths.len().saturating_sub(1));
+        let p80 = widths[p80_idx];
+        let target = p80 + p80 / 10;
+        natural_widths.push(target.max(1));
+    }
+
+    // Distribute: separators are " │ " (3 chars) between columns
+    let separators = if num_fields > 1 { (num_fields - 1) * 3 } else { 0 };
+    let available = terminal_width.saturating_sub(separators);
+    let widths = distribute_column_widths(&natural_widths, available);
+
+    TableColumnWidths { widths }
+}
+
+/// Render the table header line (column names) for table layout.
+pub fn render_table_header(schema: &Schema, layout: &TableColumnWidths) -> Vec<String> {
+    let mut header = String::new();
+    let mut separator = String::new();
+    for (ci, &cw) in layout.widths.iter().enumerate() {
+        if ci > 0 {
+            header.push_str(" │ ");
+            separator.push_str("─┼─");
+        }
+        let name = schema.fields()[ci].name();
+        let w = display_width(name);
+        if w > cw {
+            header.push_str(&truncate_to_width(name, cw));
+            let tw = display_width(&truncate_to_width(name, cw));
+            for _ in 0..cw.saturating_sub(tw) {
+                header.push(' ');
+            }
+        } else {
+            header.push_str(name);
+            for _ in 0..cw.saturating_sub(w) {
+                header.push(' ');
+            }
+        }
+        for _ in 0..cw {
+            separator.push('─');
+        }
+    }
+    vec![header, separator]
+}
+
+// ============================================================
 // RenderedRow — immutable result stored in cache
 // ============================================================
 
@@ -177,12 +273,28 @@ pub fn render_row(
     schema: &Arc<Schema>,
     w: &mut LineWriter,
     depth: usize,
+    layout: &LayoutMode,
 ) {
-    for (col_idx, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(col_idx);
-        w.guide(depth);
-        let _ = write!(w, "{}: ", field.name());
-        render_value(col, row, w, depth);
+    match layout {
+        LayoutMode::Vertical => {
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let col = batch.column(col_idx);
+                w.guide(depth);
+                let _ = write!(w, "{}: ", field.name());
+                render_value(col, row, w, depth);
+            }
+        }
+        LayoutMode::Table(table) => {
+            for (ci, &cw) in table.widths.iter().enumerate() {
+                if ci > 0 {
+                    w.buf.push_str(" │ ");
+                }
+                let col = batch.column(ci);
+                w.measure_cell(col.as_ref(), row);
+                w.write_cell_padded(cw);
+            }
+            w.newline();
+        }
     }
 }
 

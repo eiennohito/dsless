@@ -56,8 +56,8 @@ impl<K: std::hash::Hash + Eq + Clone, V> SizedLruCache<K, V> {
     }
 }
 
-const RENDERED_CACHE_BUDGET: usize = 2 * 1024 * 1024;
-const RENDERED_CACHE_MIN_ITEMS: usize = 10;
+const RENDERED_CACHE_BUDGET: usize = 4 * 1024 * 1024;
+const RENDERED_CACHE_MIN_ITEMS: usize = 200;
 
 use crate::render::RenderedRow;
 

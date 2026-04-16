@@ -5,11 +5,12 @@ use arrow::array::*;
 use arrow::datatypes::{DataType, Schema};
 
 use crate::cache::RowCache;
-use crate::render::{LineWriter, RenderedRow, render_row};
+use crate::render::{LayoutMode, LineWriter, RenderedRow, render_row, detect_layout, compute_table_layout};
 use crate::source::DataSource;
 
 pub enum WorkerRequest {
-    RenderAround(usize),
+    /// Render rows in `start..end`, skipping already-cached rows.
+    RenderRange { start: usize, end: usize },
     /// Find records matching query, scanning from `scan_from`, up to `limit` matches.
     FindMatchingRecords {
         query: String,
@@ -30,8 +31,6 @@ pub enum WorkerResponse {
     SearchProgress(usize),
 }
 
-const RENDER_MARGIN: usize = 5;
-
 pub fn worker_thread(
     mut source: Box<dyn DataSource>,
     cache: Arc<RowCache>,
@@ -40,7 +39,15 @@ pub fn worker_thread(
     terminal_width: u16,
 ) {
     let schema = source.schema().clone();
-    let mut writer = LineWriter::new(terminal_width as usize);
+    let tw = terminal_width as usize;
+    let mut writer = LineWriter::new(tw);
+
+    let layout = if detect_layout(&schema) {
+        let table = compute_table_layout(source.as_mut(), &schema, tw);
+        LayoutMode::Table(table)
+    } else {
+        LayoutMode::Vertical
+    };
 
     loop {
         let req = match rx.recv() {
@@ -51,23 +58,21 @@ pub fn worker_thread(
         let req = drain_latest(req, &rx);
 
         match req {
-            WorkerRequest::RenderAround(center_row) => {
-                let start = center_row.saturating_sub(RENDER_MARGIN);
-                let end = (center_row + RENDER_MARGIN * 2).min(source.total_rows());
-
+            WorkerRequest::RenderRange { start, end } => {
+                let end = end.min(source.total_rows());
                 for row in start..end {
                     if cache.contains(row) {
                         continue;
                     }
                     if let Ok(()) = source.ensure_loaded(row) {
-                        let rendered = render_one_row(&mut source, &schema, row, &mut writer);
+                        let rendered = render_one_row(&mut source, &schema, row, &mut writer, &layout);
                         cache.put(row, rendered);
                     }
 
                     if let Ok(newer) = rx.try_recv() {
                         let newer = drain_latest(newer, &rx);
-                        handle_requeued(
-                            &newer, &mut source, &cache, &schema, &mut writer, &rx, &tx,
+                        render_range(
+                            &newer, &mut source, &cache, &schema, &mut writer, &layout, &tx,
                         );
                         break;
                     }
@@ -87,6 +92,7 @@ pub fn worker_thread(
                     scan_from,
                     limit,
                     &mut writer,
+                    &layout,
                     &tx,
                 );
             }
@@ -100,12 +106,15 @@ fn render_one_row(
     schema: &Arc<Schema>,
     global_row: usize,
     writer: &mut LineWriter,
+    layout: &LayoutMode,
 ) -> RenderedRow {
     writer.clear();
-    let _ = write!(writer, "── Row {} ──", global_row);
-    writer.newline();
+    if matches!(layout, LayoutMode::Vertical) {
+        let _ = write!(writer, "── Row {} ──", global_row);
+        writer.newline();
+    }
     let (batch, local_row) = source.get_row(global_row);
-    render_row(batch, local_row, schema, writer, 1);
+    render_row(batch, local_row, schema, writer, 1, layout);
     writer.finish()
 }
 
@@ -120,25 +129,24 @@ fn drain_latest(initial: WorkerRequest, rx: &mpsc::Receiver<WorkerRequest>) -> W
     latest
 }
 
-fn handle_requeued(
+fn render_range(
     req: &WorkerRequest,
     source: &mut Box<dyn DataSource>,
     cache: &Arc<RowCache>,
     schema: &Arc<Schema>,
     writer: &mut LineWriter,
-    _rx: &mpsc::Receiver<WorkerRequest>,
+    layout: &LayoutMode,
     tx: &mpsc::Sender<WorkerResponse>,
 ) {
     match req {
-        WorkerRequest::RenderAround(center_row) => {
-            let start = center_row.saturating_sub(RENDER_MARGIN);
-            let end = (center_row + RENDER_MARGIN * 2).min(source.total_rows());
-            for row in start..end {
+        WorkerRequest::RenderRange { start, end } => {
+            let end = (*end).min(source.total_rows());
+            for row in *start..end {
                 if cache.contains(row) {
                     continue;
                 }
                 if let Ok(()) = source.ensure_loaded(row) {
-                    let rendered = render_one_row(source, schema, row, writer);
+                    let rendered = render_one_row(source, schema, row, writer, layout);
                     cache.put(row, rendered);
                 }
             }
@@ -149,7 +157,7 @@ fn handle_requeued(
             scan_from,
             limit,
         } => {
-            find_matching_records(source, cache, schema, query, *scan_from, *limit, writer, tx);
+            find_matching_records(source, cache, schema, query, *scan_from, *limit, writer, layout, tx);
         }
         WorkerRequest::Shutdown => {}
     }
@@ -165,6 +173,7 @@ fn find_matching_records(
     scan_from: usize,
     limit: usize,
     writer: &mut LineWriter,
+    layout: &LayoutMode,
     tx: &mpsc::Sender<WorkerResponse>,
 ) {
     let query_lower = query.to_lowercase();
@@ -192,7 +201,7 @@ fn find_matching_records(
         }
 
         // Render and verify
-        let rendered = ensure_rendered(source, cache, schema, cursor, writer);
+        let rendered = ensure_rendered(source, cache, schema, cursor, writer, layout);
         let has_match = (0..rendered.line_count())
             .any(|i| rendered.line(i).to_lowercase().contains(&query_lower));
 
@@ -216,12 +225,13 @@ fn ensure_rendered(
     schema: &Arc<Schema>,
     global_row: usize,
     writer: &mut LineWriter,
+    layout: &LayoutMode,
 ) -> Arc<RenderedRow> {
     if let Some(cached) = cache.get(global_row) {
         return cached;
     }
     let _ = source.ensure_loaded(global_row);
-    let rendered = render_one_row(source, schema, global_row, writer);
+    let rendered = render_one_row(source, schema, global_row, writer, layout);
     let arc = Arc::new(rendered);
     // We don't cache search-rendered rows to avoid evicting nearby rows.
     // The RenderAround pass will cache them when the user navigates there.
