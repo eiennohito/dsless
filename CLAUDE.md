@@ -42,14 +42,8 @@ Evolution is data-driven. The system captures correct raw data; the logic that p
 - **Scope Decisions Are Not Yours to Make Silently**: When you identify related work during planning, you have two acceptable options: (1) **Include it** — if excluding would break logical coherence (same code, same reasoning chain, enabled by the same change). This is the default. (2) **Ask** — "this is related but separable, should we park it?" Let the user decide. You do NOT get to unilaterally exclude work — not silently, not aloud. "That's separate work" is never a conclusion; it is at best the start of a question to the user.
 - **Meta Feedback**: Workflow improvements are perishable. On "meta:" prefix, pause immediately. Propose instruction-file changes via Review Mode, apply after approval, then resume the original task. Always update project documentation, CLAUDE.md instead of memory files.
 
-## Plans (`docs/plans/`)
-Plans are handoff docs for keeping context between cold-start sessions. They are the primary continuity mechanism — write for the agent that picks this up in 2 hours, not for posterity.
-
-- **Format is adhoc.** No template. Natural structure is problem → high-level approach → low-level details, but the shape follows the problem. Rejected alternatives and why are the highest-value content — they prevent the next session from re-deriving the same options.
-- **Plans are high-level.** They must contain human-readable description of most non-trivial logic. For code references, prefer minimal references to the entry points of code that will help understand the logic or decision points.
-- **Lifecycle**: Plans exist while work is in-flight. When the work is done, **delete the plan** and push its knowledge into persistent artifacts (Docstrings, AGENTS.md, test descriptions, doc files). Completed plans left in the workspace become stale context that misleads future sessions.
-- **Index (`docs/plans/_index.md`)**: Tracks active plans (one-liner + status per file) and a **parking lot** for small ideas — the "we should do this, maybe later" observations that aren't worth a plan file yet. Update the index when creating or deleting plans, and when ideas come up during any session.
-- **When to plan**: If you need to think before coding, the thinking goes in a plan. If you don't, just code. Mixing planning and implementation in the same pass compounds errors — for complex tasks, write the plan first, then implement.
+## Plans
+This project uses Github Issues for plan tracking. Create issues using `gh` tool. Never use per-project memory as it is local only.
 
 ## Architecture
 
