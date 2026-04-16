@@ -603,19 +603,30 @@ fn write_table_cell_value(out: &mut String, array: &dyn Array, row: usize) {
                 out.push_str("{}");
             } else {
                 let keys = ma.keys();
-                let preview_count = len.min(3);
+                let values = ma.values();
                 out.push('{');
-                for i in 0..preview_count {
+                // Write key: value pairs until we've produced enough text.
+                // Downstream truncation handles the final cut, but we avoid
+                // generating megabytes for huge maps.
+                const MAX_PREVIEW_WIDTH: usize = 300;
+                let mut shown = 0;
+                for i in 0..len {
                     if i > 0 {
                         out.push_str(", ");
                     }
+                    if display_width(out.as_str()) > MAX_PREVIEW_WIDTH {
+                        let remaining = len - i;
+                        let _ = write!(out, "+{}", remaining);
+                        break;
+                    }
                     write_scalar_to_string(out, keys.as_ref(), start + i);
+                    out.push_str(": ");
+                    write_scalar_to_string(out, values.as_ref(), start + i);
+                    shown += 1;
                 }
-                out.push_str(": …");
-                if len > preview_count {
-                    let _ = write!(out, ", +{}", len - preview_count);
+                if shown == len {
+                    out.push('}');
                 }
-                out.push('}');
             }
         }
         _ => write_scalar_to_string(out, array, row),
