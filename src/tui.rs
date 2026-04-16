@@ -139,9 +139,10 @@ fn run_app(
     let (worker_tx, worker_rx) = mpsc::channel();
     let (response_tx, response_rx) = mpsc::channel();
 
+    let terminal_width = terminal.size()?.width;
     let cache_clone = Arc::clone(&cache);
     let worker_handle = thread::spawn(move || {
-        worker_thread(source, cache_clone, worker_rx, response_tx);
+        worker_thread(source, cache_clone, worker_rx, response_tx, terminal_width);
     });
 
     worker_tx.send(WorkerRequest::RenderAround(0))?;

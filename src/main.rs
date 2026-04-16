@@ -48,7 +48,8 @@ fn run_pipe(mut source: Box<dyn DataSource>, max_rows: usize) -> Result<()> {
     }
 
     use std::fmt::Write;
-    let mut writer = render::LineWriter::new();
+    let term_width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
+    let mut writer = render::LineWriter::new(term_width);
     let total = source.total_rows().min(max_rows);
     for global_row in 0..total {
         writer.clear();

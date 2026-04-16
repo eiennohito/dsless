@@ -78,14 +78,17 @@ pub struct LineWriter {
     buf: String,
     line_starts: Vec<usize>,
     scratch: String,
+    /// Terminal width in display columns. Used for smart column sizing.
+    terminal_width: usize,
 }
 
 impl LineWriter {
-    pub fn new() -> Self {
+    pub fn new(terminal_width: usize) -> Self {
         LineWriter {
             buf: String::new(),
             line_starts: vec![0],
             scratch: String::new(),
+            terminal_width,
         }
     }
 
@@ -133,7 +136,12 @@ impl LineWriter {
         let vw = display_width(&self.scratch);
         if vw > width {
             let truncated = truncate_to_width(&self.scratch, width);
+            let tw = display_width(&truncated);
             self.buf.push_str(&truncated);
+            // Pad remainder — CJK chars (width 2) can leave a 1-column gap
+            for _ in 0..width.saturating_sub(tw) {
+                self.buf.push(' ');
+            }
         } else {
             self.buf.push_str(&self.scratch);
             for _ in 0..(width - vw) {
@@ -266,8 +274,6 @@ fn render_value(array: &dyn Array, row: usize, w: &mut LineWriter, depth: usize)
 // Table layout for list-of-struct
 // ============================================================
 
-const MAX_COL_WIDTH: usize = 60;
-
 fn render_struct_list_as_table(
     struct_array: &StructArray,
     start: usize,
@@ -284,18 +290,32 @@ fn render_struct_list_as_table(
 
     let num_fields = struct_array.num_columns();
 
-    // Pass 1: measure column widths using scratch buffer
-    let mut col_widths: Vec<usize> = Vec::with_capacity(num_fields);
+    // Pass 1: measure column widths using ~80th percentile
+    let num_rows = end - start;
+    let mut natural_widths: Vec<usize> = Vec::with_capacity(num_fields);
     for ci in 0..num_fields {
         let header_w = display_width(struct_array.fields()[ci].name());
         let col = struct_array.column(ci);
-        let mut max_w = header_w;
+        let mut widths: Vec<usize> = Vec::with_capacity(num_rows);
         for row in start..end {
-            let cell_w = w.measure_cell(col.as_ref(), row);
-            max_w = max_w.max(cell_w);
+            widths.push(w.measure_cell(col.as_ref(), row));
         }
-        col_widths.push(max_w.min(MAX_COL_WIDTH));
+        widths.sort_unstable();
+        // p80 index, +10% padding, but at least header width
+        let p80_idx = (num_rows * 4 / 5).min(num_rows.saturating_sub(1));
+        let p80 = widths[p80_idx];
+        let target = p80 + p80 / 10; // +10% headroom
+        natural_widths.push(target.max(header_w));
     }
+
+    // Pass 1b: distribute available width smartly across columns
+    // Available = terminal_width - guide indent - left padding - separators
+    let guide_width = (depth + 1) * 2; // "│ " per depth level
+    let left_pad = 2; // "  " before first column
+    let separators = if num_fields > 1 { (num_fields - 1) * 3 } else { 0 }; // " │ "
+    let overhead = guide_width + left_pad + separators;
+    let available = w.terminal_width.saturating_sub(overhead);
+    let col_widths = distribute_column_widths(&natural_widths, available);
 
     // Header: "(N items)"
     let _ = write!(w, "({} items)", count);
@@ -339,6 +359,69 @@ fn render_struct_list_as_table(
         }
         w.newline();
     }
+}
+
+/// Distribute `available` width across columns.
+/// Columns that fit naturally get their natural width.
+/// Remaining space is split evenly among columns that need more.
+fn distribute_column_widths(natural: &[usize], available: usize) -> Vec<usize> {
+    let num = natural.len();
+    if num == 0 {
+        return vec![];
+    }
+
+    // Minimum useful width per column
+    const MIN_COL: usize = 8;
+
+    let total_natural: usize = natural.iter().sum();
+    if total_natural <= available {
+        // Everything fits — use natural widths
+        return natural.to_vec();
+    }
+
+    // Iterative allocation: give small columns their natural width,
+    // split the rest among overflowing columns.
+    let mut allocated = vec![0usize; num];
+    let mut settled = vec![false; num];
+    let mut remaining = available;
+
+    loop {
+        let unsettled: usize = settled.iter().filter(|&&s| !s).count();
+        if unsettled == 0 {
+            break;
+        }
+        let fair_share = remaining / unsettled;
+
+        let mut changed = false;
+        for i in 0..num {
+            if settled[i] {
+                continue;
+            }
+            if natural[i] <= fair_share {
+                // This column fits in its fair share — give it natural width
+                allocated[i] = natural[i];
+                settled[i] = true;
+                remaining -= natural[i];
+                changed = true;
+            }
+        }
+
+        if !changed {
+            // No column settled — all remaining columns are wider than fair share.
+            // Split remaining space evenly.
+            let unsettled_indices: Vec<usize> = (0..num).filter(|&i| !settled[i]).collect();
+            let share = remaining / unsettled_indices.len().max(1);
+            let mut leftover = remaining % unsettled_indices.len().max(1);
+            for &i in &unsettled_indices {
+                let w = share + if leftover > 0 { leftover -= 1; 1 } else { 0 };
+                allocated[i] = w.max(MIN_COL);
+                settled[i] = true;
+            }
+            break;
+        }
+    }
+
+    allocated
 }
 
 // ============================================================

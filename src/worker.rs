@@ -37,9 +37,10 @@ pub fn worker_thread(
     cache: Arc<RowCache>,
     rx: mpsc::Receiver<WorkerRequest>,
     tx: mpsc::Sender<WorkerResponse>,
+    terminal_width: u16,
 ) {
     let schema = source.schema().clone();
-    let mut writer = LineWriter::new();
+    let mut writer = LineWriter::new(terminal_width as usize);
 
     loop {
         let req = match rx.recv() {
