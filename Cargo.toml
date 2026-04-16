@@ -14,3 +14,4 @@ clap = { version = "4", features = ["derive"] }
 unicode-width = "0.2"
 lru = "0.17"
 ryu = "1.0.23"
+rustc-hash = "2.1.2"

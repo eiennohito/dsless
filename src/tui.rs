@@ -6,6 +6,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use rustc_hash::FxHashSet;
 
 use crate::cache::RowCache;
 use crate::layout::{Layout, RenderSpec};
@@ -20,8 +21,11 @@ const SEARCH_BATCH_SIZE: usize = 100;
 
 struct SearchState {
     query: String,
-    /// Matched record (row) indices, in dataset order.
+    query_lower: String,
+    /// Matched record (row) indices, in dataset order (sorted).
     matched_rows: Vec<usize>,
+    /// O(1) membership test for matched rows.
+    matched_set: FxHashSet<usize>,
     /// True if the entire dataset has been scanned.
     exhausted: bool,
     /// Where the worker stopped scanning (for lazy continuation).
@@ -34,14 +38,24 @@ struct SearchState {
 
 impl SearchState {
     fn new(query: String) -> Self {
+        let query_lower = query.to_lowercase();
         SearchState {
             query,
+            query_lower,
             matched_rows: Vec::new(),
+            matched_set: FxHashSet::default(),
             exhausted: false,
             scan_cursor: 0,
             current_idx: 0,
             record_line_matches: Vec::new(),
         }
+    }
+
+    fn extend_matches(&mut self, matches: Vec<usize>) {
+        for &row in &matches {
+            self.matched_set.insert(row);
+        }
+        self.matched_rows.extend(matches);
     }
 
     fn match_count_display(&self) -> String {
@@ -52,31 +66,31 @@ impl SearchState {
         }
     }
 
-    /// Update level-2 matches for the given row using cached rendered content.
     fn update_record_matches(&mut self, cache: &RowCache, row: usize) {
         self.record_line_matches.clear();
-        let query_lower = self.query.to_lowercase();
         if let Some(rendered) = cache.get(row) {
             for i in 0..rendered.line_count() {
-                if rendered.line(i).to_lowercase().contains(&query_lower) {
+                if rendered.line(i).to_lowercase().contains(&self.query_lower) {
                     self.record_line_matches.push(i);
                 }
             }
         }
     }
 
-    /// Find the next match index that is past `last_visible_row`.
+    /// Find the next match index past `last_visible_row`. Binary search since matched_rows is sorted.
     fn next_after(&self, last_visible_row: usize) -> Option<usize> {
-        self.matched_rows
-            .iter()
-            .position(|&r| r > last_visible_row)
+        let idx = self.matched_rows.partition_point(|&r| r <= last_visible_row);
+        if idx < self.matched_rows.len() {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
-    /// Find the previous match index that is before `first_visible_row`.
+    /// Find the previous match index before `first_visible_row`.
     fn prev_before(&self, first_visible_row: usize) -> Option<usize> {
-        self.matched_rows
-            .iter()
-            .rposition(|&r| r < first_visible_row)
+        let idx = self.matched_rows.partition_point(|&r| r < first_visible_row);
+        idx.checked_sub(1)
     }
 }
 
@@ -213,7 +227,7 @@ fn run_app(
                     search_progress = None;
                     if let Some(ref mut s) = search {
                         let first_batch = s.matched_rows.is_empty();
-                        s.matched_rows.extend(matches);
+                        s.extend_matches(matches);
                         s.exhausted = exhausted;
                         s.scan_cursor = scanned_up_to;
 
@@ -706,10 +720,9 @@ fn navigate_to_match(
 // ============================================================
 
 fn style_line<'a>(line: &str, row: usize, search: &Option<SearchState>) -> Line<'a> {
-    // Check if this row is a search match
     let is_match_row = search
         .as_ref()
-        .is_some_and(|s| s.matched_rows.contains(&row));
+        .is_some_and(|s| s.matched_set.contains(&row));
 
     if line.starts_with("── Row") {
         let style = if is_match_row {
@@ -725,12 +738,8 @@ fn style_line<'a>(line: &str, row: usize, search: &Option<SearchState>) -> Line<
     } else if is_match_row
         && search
             .as_ref()
-            .is_some_and(|s| {
-                let q = s.query.to_lowercase();
-                line.to_lowercase().contains(&q)
-            })
+            .is_some_and(|s| line.to_lowercase().contains(&s.query_lower))
     {
-        // Highlight matching lines within matching records
         Line::from(Span::styled(
             line.to_string(),
             Style::default().bg(Color::DarkGray).fg(Color::White),
