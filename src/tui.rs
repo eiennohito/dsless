@@ -458,7 +458,7 @@ fn run_app(
                 }
 
                 // --- Page scroll ---
-                KeyCode::Char('K') | KeyCode::PageDown => {
+                KeyCode::Char('J') | KeyCode::PageDown => {
                     scroll_down(
                         &cache,
                         &mut current_row,
@@ -468,7 +468,7 @@ fn run_app(
                     );
                     show_header = false;
                 }
-                KeyCode::Char('J') | KeyCode::PageUp => {
+                KeyCode::Char('K') | KeyCode::PageUp => {
                     scroll_up(&cache, &mut current_row, &mut line_offset, visible_height);
                     if current_row == 0 && line_offset == 0 {
                         show_header = true;
@@ -650,8 +650,8 @@ fn render_help_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from(Span::styled(" Scrolling", Style::default().add_modifier(Modifier::BOLD))),
         Line::from("  j / Down      line down"),
         Line::from("  k / Up        line up"),
-        Line::from("  K / PageDown  page down"),
-        Line::from("  J / PageUp    page up"),
+        Line::from("  J / PageDown  page down"),
+        Line::from("  K / PageUp    page up"),
         Line::from("  Space/Ctrl-d  half page down"),
         Line::from("  Ctrl-u        half page up"),
         Line::from(""),
