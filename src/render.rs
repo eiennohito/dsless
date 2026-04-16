@@ -510,9 +510,18 @@ impl LineWriter {
 
     fn write_padded(&mut self, s: &str, width: usize) {
         let w = display_width(s);
-        self.buf.push_str(s);
-        for _ in 0..(width.saturating_sub(w)) {
-            self.buf.push(' ');
+        if w > width {
+            let truncated = truncate_to_width(s, width);
+            let tw = display_width(&truncated);
+            self.buf.push_str(&truncated);
+            for _ in 0..width.saturating_sub(tw) {
+                self.buf.push(' ');
+            }
+        } else {
+            self.buf.push_str(s);
+            for _ in 0..(width - w) {
+                self.buf.push(' ');
+            }
         }
     }
 }
