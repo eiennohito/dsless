@@ -1,3 +1,4 @@
+pub mod jsonl;
 pub mod parquet;
 
 use std::path::Path;
@@ -27,12 +28,65 @@ pub trait DataSource: Send {
     fn get_row(&mut self, global_row: usize) -> (&RecordBatch, usize);
 }
 
+enum Format {
+    Parquet,
+    Jsonl,
+}
+
+fn detect_format(path: &Path) -> Result<Format> {
+    if path.is_file() {
+        return format_from_extension(path);
+    }
+    if !path.is_dir() {
+        anyhow::bail!("{:?} is not a file or directory", path);
+    }
+
+    let mut has_parquet = false;
+    let mut has_jsonl = false;
+
+    for entry in std::fs::read_dir(path)?.filter_map(|e| e.ok()) {
+        match entry.path().extension().and_then(|e| e.to_str()) {
+            Some("parquet") => has_parquet = true,
+            Some("jsonl" | "ndjson") => has_jsonl = true,
+            _ => {}
+        }
+    }
+
+    match (has_parquet, has_jsonl) {
+        (true, false) => Ok(Format::Parquet),
+        (false, true) => Ok(Format::Jsonl),
+        (true, true) => anyhow::bail!(
+            "Directory {:?} contains mixed formats (parquet and jsonl)",
+            path
+        ),
+        _ => anyhow::bail!(
+            "No supported files in {:?} (supported: .parquet, .jsonl, .ndjson)",
+            path
+        ),
+    }
+}
+
+fn format_from_extension(path: &Path) -> Result<Format> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("parquet") => Ok(Format::Parquet),
+        Some("jsonl" | "ndjson") => Ok(Format::Jsonl),
+        Some(ext) => anyhow::bail!("Unsupported file format: .{ext}"),
+        None => anyhow::bail!("Cannot determine format of {:?} (no extension)", path),
+    }
+}
+
 /// Detect format from path and open the appropriate source.
 pub fn open(path: &Path) -> Result<Box<dyn DataSource>> {
-    // For now, only parquet is supported.
-    // Future: check extension / magic bytes for jsonl, orc, csv, etc.
-    let source = parquet::ParquetSource::open(path)?;
-    Ok(Box::new(source))
+    match detect_format(path)? {
+        Format::Parquet => {
+            let source = parquet::ParquetSource::open(path)?;
+            Ok(Box::new(source))
+        }
+        Format::Jsonl => {
+            let source = jsonl::JsonlSource::open(path)?;
+            Ok(Box::new(source))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -68,10 +122,9 @@ pub mod test_support {
                 Field::new("name", DataType::Utf8, false),
                 Field::new("value", DataType::Int32, false),
             ]));
-            let batch = RecordBatch::try_new(
-                schema,
-                vec![Arc::new(str_array), Arc::new(int_array)],
-            ).unwrap();
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(str_array), Arc::new(int_array)])
+                    .unwrap();
             Self::from_batch(batch)
         }
     }

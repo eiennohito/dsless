@@ -65,7 +65,9 @@ impl SearchState {
     }
 
     pub fn next_after(&self, last_visible_row: usize) -> Option<usize> {
-        let idx = self.matched_rows.partition_point(|&r| r <= last_visible_row);
+        let idx = self
+            .matched_rows
+            .partition_point(|&r| r <= last_visible_row);
         if idx < self.matched_rows.len() {
             Some(idx)
         } else {
@@ -74,7 +76,9 @@ impl SearchState {
     }
 
     pub fn prev_before(&self, first_visible_row: usize) -> Option<usize> {
-        let idx = self.matched_rows.partition_point(|&r| r < first_visible_row);
+        let idx = self
+            .matched_rows
+            .partition_point(|&r| r < first_visible_row);
         idx.checked_sub(1)
     }
 }
@@ -227,13 +231,20 @@ mod tests {
 
     #[test]
     fn find_records_basic() {
-        let mut source = FakeDataSource::single_string_column("text", &["hello", "world", "hello world"]);
+        let mut source =
+            FakeDataSource::single_string_column("text", &["hello", "world", "hello world"]);
         let layout = Layout::compute(&mut source);
         let spec = RenderSpec::resolve(&layout, 80);
         let mut writer = LineWriter::new();
 
         let result = find_matching_records(
-            &mut source, &spec, "hello", 0, 100, &mut writer, &mut |_| {},
+            &mut source,
+            &spec,
+            "hello",
+            0,
+            100,
+            &mut writer,
+            &mut |_| {},
         );
 
         assert_eq!(result.matches, vec![0, 2]);
@@ -247,9 +258,7 @@ mod tests {
         let spec = RenderSpec::resolve(&layout, 80);
         let mut writer = LineWriter::new();
 
-        let result = find_matching_records(
-            &mut source, &spec, "a", 0, 2, &mut writer, &mut |_| {},
-        );
+        let result = find_matching_records(&mut source, &spec, "a", 0, 2, &mut writer, &mut |_| {});
 
         assert_eq!(result.matches.len(), 2);
         assert!(!result.exhausted);
@@ -263,9 +272,8 @@ mod tests {
         let spec = RenderSpec::resolve(&layout, 80);
         let mut writer = LineWriter::new();
 
-        let result = find_matching_records(
-            &mut source, &spec, "a", 2, 100, &mut writer, &mut |_| {},
-        );
+        let result =
+            find_matching_records(&mut source, &spec, "a", 2, 100, &mut writer, &mut |_| {});
 
         assert_eq!(result.matches, vec![2, 4]);
         assert!(result.exhausted);

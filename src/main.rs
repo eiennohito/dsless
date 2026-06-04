@@ -40,7 +40,9 @@ fn main() -> Result<()> {
 
 fn run_pipe(mut source: Box<dyn DataSource>, max_rows: usize) -> Result<()> {
     let schema = source.schema().clone();
-    let term_width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
+    let term_width = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(120);
 
     let lo = layout::Layout::compute(source.as_mut());
     let spec = layout::RenderSpec::resolve(&lo, term_width);
@@ -74,10 +76,7 @@ fn run_pipe(mut source: Box<dyn DataSource>, max_rows: usize) -> Result<()> {
     }
 
     if total >= max_rows && max_rows < source.total_rows() {
-        println!(
-            "... (stopped at {} rows, use -n to load more)",
-            max_rows
-        );
+        println!("... (stopped at {} rows, use -n to load more)", max_rows);
     } else {
         println!("Total: {} rows", total);
     }

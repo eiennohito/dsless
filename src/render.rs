@@ -87,7 +87,9 @@ impl RenderSpecNode {
                     }
                     let schema_idx = col_order[di];
                     let col = batch.column(schema_idx);
-                    children[di].1.measure_cell(col.as_ref(), row, &mut w.scratch);
+                    children[di]
+                        .1
+                        .measure_cell(col.as_ref(), row, &mut w.scratch);
                     w.write_cell_padded(cw);
                 }
                 w.newline();
@@ -136,10 +138,7 @@ impl RenderSpecNode {
                 write_string_verbose(&mut w.buf, array, row, *max_display);
                 w.newline();
             }
-            RenderSpecKind::Struct {
-                children,
-                ..
-            } => {
+            RenderSpecKind::Struct { children, .. } => {
                 let sa = array.as_any().downcast_ref::<StructArray>().unwrap();
                 w.newline();
                 for (ci, (name, child_spec)) in children.iter().enumerate() {
@@ -167,7 +166,16 @@ impl RenderSpecNode {
                 } = &element.kind
                 {
                     let sa = values.as_any().downcast_ref::<StructArray>().unwrap();
-                    render_nested_table(sa, start, end, child_specs, col_widths, col_order, row_prefix, w);
+                    render_nested_table(
+                        sa,
+                        start,
+                        end,
+                        child_specs,
+                        col_widths,
+                        col_order,
+                        row_prefix,
+                        w,
+                    );
                     return;
                 }
                 // Scalar list: inline
@@ -330,7 +338,10 @@ impl RenderSpecNode {
     /// Write a scalar value inline (no newline). Used for scalar lists and map keys.
     fn write_scalar_inline(&self, out: &mut String, array: &dyn Array, row: usize) {
         match &self.kind {
-            RenderSpecKind::Float { precision, exponential } => {
+            RenderSpecKind::Float {
+                precision,
+                exponential,
+            } => {
                 write_float_to(out, array, row, *precision, *exponential);
             }
             RenderSpecKind::Str { .. } => {
@@ -393,7 +404,9 @@ fn render_nested_table(
             }
             let schema_idx = col_order[di];
             let col = sa.column(schema_idx);
-            child_specs[di].1.measure_cell(col.as_ref(), row, &mut w.scratch);
+            child_specs[di]
+                .1
+                .measure_cell(col.as_ref(), row, &mut w.scratch);
             w.write_cell_padded(cw);
         }
         w.newline();
@@ -555,7 +568,13 @@ impl fmt::Write for LineWriter {
 /// Column truncation (write_cell_padded) handles the visual cut.
 const CELL_PREVIEW_BUDGET: usize = 512;
 
-fn write_float_to(out: &mut String, array: &dyn Array, row: usize, precision: u8, exponential: bool) {
+fn write_float_to(
+    out: &mut String,
+    array: &dyn Array,
+    row: usize,
+    precision: u8,
+    exponential: bool,
+) {
     if array.is_null(row) {
         out.push_str("null");
         return;
@@ -690,14 +709,12 @@ pub(crate) fn write_scalar_to(out: &mut String, array: &dyn Array, row: usize) {
                 Err(_) => out.push_str("<timestamp>"),
             }
         }
-        _ => {
-            match arrow::util::display::array_value_to_string(array, row) {
-                Ok(s) => out.push_str(&s),
-                Err(_) => {
-                    let _ = write!(out, "<{}>", array.data_type());
-                }
+        _ => match arrow::util::display::array_value_to_string(array, row) {
+            Ok(s) => out.push_str(&s),
+            Err(_) => {
+                let _ = write!(out, "<{}>", array.data_type());
             }
-        }
+        },
     }
 }
 
@@ -782,7 +799,13 @@ mod tests {
 
         let header = spec.render_table_header();
         assert_eq!(header.len(), 2);
-        assert!(header[0].contains("│"), "header should have column separator");
-        assert!(header[1].contains("─┼─"), "separator row should have crossing");
+        assert!(
+            header[0].contains("│"),
+            "header should have column separator"
+        );
+        assert!(
+            header[1].contains("─┼─"),
+            "separator row should have crossing"
+        );
     }
 }

@@ -284,10 +284,7 @@ impl LayoutBuilder {
                 let len = extract_string_width(array, row);
                 lengths.push(len);
             }
-            LayoutBuilder::Struct {
-                children,
-                widths,
-            } => {
+            LayoutBuilder::Struct { children, widths } => {
                 measure_cell_width(scratch, array, row);
                 widths.record(display_width(scratch));
                 let sa = array.as_any().downcast_ref::<StructArray>().unwrap();
@@ -343,9 +340,14 @@ impl LayoutBuilder {
             unreachable!("root must be Struct");
         };
         // Top-level: table only if all fields are scalar
-        let all_scalar = children
-            .iter()
-            .all(|(_, child)| matches!(child, LayoutBuilder::Scalar { .. } | LayoutBuilder::Float { .. } | LayoutBuilder::Str { .. }));
+        let all_scalar = children.iter().all(|(_, child)| {
+            matches!(
+                child,
+                LayoutBuilder::Scalar { .. }
+                    | LayoutBuilder::Float { .. }
+                    | LayoutBuilder::Str { .. }
+            )
+        });
 
         let resolved: Vec<(String, LayoutNode)> = children
             .into_iter()
@@ -377,7 +379,10 @@ impl LayoutBuilder {
                 header_width,
                 kind: LayoutKind::Scalar,
             },
-            LayoutBuilder::Float { mut widths, mut values } => {
+            LayoutBuilder::Float {
+                mut widths,
+                mut values,
+            } => {
                 let (precision, exponential) = compute_float_precision(&mut values);
                 LayoutNode {
                     natural_width: widths.p80_plus10(),
@@ -389,7 +394,10 @@ impl LayoutBuilder {
                     },
                 }
             }
-            LayoutBuilder::Str { mut widths, mut lengths } => {
+            LayoutBuilder::Str {
+                mut widths,
+                mut lengths,
+            } => {
                 let max_display = resolve_str_max_display(&mut lengths);
                 LayoutNode {
                     natural_width: widths.p80_plus10(),
@@ -398,7 +406,10 @@ impl LayoutBuilder {
                     kind: LayoutKind::Str { max_display },
                 }
             }
-            LayoutBuilder::Struct { children, mut widths } => {
+            LayoutBuilder::Struct {
+                children,
+                mut widths,
+            } => {
                 let table_ok = children.iter().all(|(_, child)| !has_nested_struct(child));
                 let resolved: Vec<(String, LayoutNode)> = children
                     .into_iter()
@@ -418,7 +429,10 @@ impl LayoutBuilder {
                     },
                 }
             }
-            LayoutBuilder::List { element, mut widths } => {
+            LayoutBuilder::List {
+                element,
+                mut widths,
+            } => {
                 let element_node = element.resolve(0);
                 LayoutNode {
                     natural_width: widths.p80_plus10(),
@@ -429,7 +443,11 @@ impl LayoutBuilder {
                     },
                 }
             }
-            LayoutBuilder::Map { key, value, mut widths } => {
+            LayoutBuilder::Map {
+                key,
+                value,
+                mut widths,
+            } => {
                 let key_node = key.resolve(0);
                 let value_node = value.resolve(0);
                 LayoutNode {
@@ -466,7 +484,6 @@ fn has_nested_struct(node: &LayoutBuilder) -> bool {
     }
 }
 
-
 pub(crate) fn extract_float(array: &dyn Array, row: usize) -> f64 {
     if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
         a.value(row)
@@ -488,7 +505,6 @@ fn measure_cell_width(scratch: &mut String, array: &dyn Array, row: usize) {
     render::write_scalar_to(scratch, array, row);
 }
 
-
 /// Count decimal digits in the shortest roundtrip representation of a float.
 fn decimal_digit_count(v: f64) -> u8 {
     let mut buf = ryu::Buffer::new();
@@ -497,7 +513,11 @@ fn decimal_digit_count(v: f64) -> u8 {
         Some(dot) => {
             let frac = &s[dot + 1..];
             let trimmed = frac.trim_end_matches('0');
-            if trimmed.is_empty() { 0 } else { trimmed.len() as u8 }
+            if trimmed.is_empty() {
+                0
+            } else {
+                trimmed.len() as u8
+            }
         }
         None => 0,
     }
@@ -581,7 +601,6 @@ fn compute_float_precision(values: &mut [f64]) -> (u8, bool) {
     let precision = bucket_precision.min(p90).max(1);
     (precision.min(6), false)
 }
-
 
 /// Minimum useful column width.
 const MIN_COL: usize = 8;
@@ -733,7 +752,9 @@ fn resolve_struct(
             // Cap at p80 + 10% so outlier-wide values don't waste space
             let data_w = node.natural_width;
             // Use header width if wider, but don't let it dominate
-            data_w.max(node.header_width.min(data_w + data_w / 10)).max(1)
+            data_w
+                .max(node.header_width.min(data_w + data_w / 10))
+                .max(1)
         })
         .collect();
 
@@ -775,7 +796,8 @@ fn resolve_struct(
             .collect()
     } else {
         // All bounded: distribute normally in display order
-        let ordered_naturals: Vec<usize> = display_order.iter().map(|&i| natural_widths[i]).collect();
+        let ordered_naturals: Vec<usize> =
+            display_order.iter().map(|&i| natural_widths[i]).collect();
         distribute_column_widths(&ordered_naturals, distributable)
     };
 
@@ -853,14 +875,16 @@ fn align_adjacent_tables(root: &mut RenderSpecNode) {
     let mut all_adjustments: Vec<(usize, usize, usize)> = Vec::new();
 
     // Align each separator index independently across all tables that have it
-    let max_seps = group.iter().map(|t| t.info.sep_positions.len()).max().unwrap_or(0);
+    let max_seps = group
+        .iter()
+        .map(|t| t.info.sep_positions.len())
+        .max()
+        .unwrap_or(0);
     for sep_idx in 0..max_seps {
         let participants: Vec<(usize, usize)> = group
             .iter()
             .enumerate()
-            .filter_map(|(ti, entry)| {
-                entry.info.sep_positions.get(sep_idx).map(|&pos| (ti, pos))
-            })
+            .filter_map(|(ti, entry)| entry.info.sep_positions.get(sep_idx).map(|&pos| (ti, pos)))
             .collect();
 
         if participants.len() < 2 {
@@ -887,7 +911,9 @@ fn align_adjacent_tables(root: &mut RenderSpecNode) {
 /// Path records struct child indices only; List/Map are transparent.
 fn collect_tables(node: &RenderSpecNode, path: &mut Vec<usize>, out: &mut Vec<TableEntry>) {
     match &node.kind {
-        RenderSpecKind::Struct { table_mode: true, .. } => {
+        RenderSpecKind::Struct {
+            table_mode: true, ..
+        } => {
             out.push(TableEntry {
                 path: path.clone(),
                 info: TableAlignInfo::from_spec(node),
@@ -895,7 +921,11 @@ fn collect_tables(node: &RenderSpecNode, path: &mut Vec<usize>, out: &mut Vec<Ta
             // Don't recurse into table children — nested tables inside
             // a table cell are a different visual context
         }
-        RenderSpecKind::Struct { children, table_mode: false, .. } => {
+        RenderSpecKind::Struct {
+            children,
+            table_mode: false,
+            ..
+        } => {
             for (i, (_, child)) in children.iter().enumerate() {
                 path.push(i);
                 collect_tables(child, path, out);
@@ -918,8 +948,16 @@ fn collect_tables(node: &RenderSpecNode, path: &mut Vec<usize>, out: &mut Vec<Ta
 fn navigate_mut<'a>(root: &'a mut RenderSpecNode, path: &[usize]) -> &'a mut RenderSpecNode {
     let mut node = root;
     let mut i = 0;
-    while i < path.len() || matches!(&node.kind, RenderSpecKind::List { .. } | RenderSpecKind::Map { .. }) {
-        enum Step { Child(usize), Transparent }
+    while i < path.len()
+        || matches!(
+            &node.kind,
+            RenderSpecKind::List { .. } | RenderSpecKind::Map { .. }
+        )
+    {
+        enum Step {
+            Child(usize),
+            Transparent,
+        }
         let step = match &node.kind {
             RenderSpecKind::Struct { .. } if i < path.len() => Step::Child(path[i]),
             RenderSpecKind::List { .. } | RenderSpecKind::Map { .. } => Step::Transparent,
@@ -927,7 +965,9 @@ fn navigate_mut<'a>(root: &'a mut RenderSpecNode, path: &[usize]) -> &'a mut Ren
         };
         match step {
             Step::Child(idx) => {
-                let RenderSpecKind::Struct { children, .. } = &mut node.kind else { unreachable!() };
+                let RenderSpecKind::Struct { children, .. } = &mut node.kind else {
+                    unreachable!()
+                };
                 node = &mut children[idx].1;
                 i += 1;
             }
@@ -973,7 +1013,9 @@ impl TableAlignInfo {
             }
         }
 
-        TableAlignInfo { sep_positions: seps }
+        TableAlignInfo {
+            sep_positions: seps,
+        }
     }
 }
 
@@ -1094,7 +1136,13 @@ pub fn distribute_column_widths(natural: &[usize], available: usize) -> Vec<usiz
             let share = remaining / unsettled_indices.len().max(1);
             let mut leftover = remaining % unsettled_indices.len().max(1);
             for &i in &unsettled_indices {
-                let w = share + if leftover > 0 { leftover -= 1; 1 } else { 0 };
+                let w = share
+                    + if leftover > 0 {
+                        leftover -= 1;
+                        1
+                    } else {
+                        0
+                    };
                 allocated[i] = w.max(MIN_COL);
                 settled[i] = true;
             }
@@ -1104,7 +1152,6 @@ pub fn distribute_column_widths(natural: &[usize], available: usize) -> Vec<usiz
 
     allocated
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1407,9 +1454,15 @@ mod tests {
     #[test]
     fn test_float_precision_uniform_currency() {
         // All values have exactly 2 decimal places
-        let mut values = vec![1.50, 2.75, 3.00, 4.25, 5.99, 10.50, 20.00, 15.75, 8.25, 99.99];
+        let mut values = vec![
+            1.50, 2.75, 3.00, 4.25, 5.99, 10.50, 20.00, 15.75, 8.25, 99.99,
+        ];
         let (precision, exponential) = compute_float_precision(&mut values);
-        assert!(precision <= 2, "currency should have precision <= 2, got {}", precision);
+        assert!(
+            precision <= 2,
+            "currency should have precision <= 2, got {}",
+            precision
+        );
         assert!(!exponential);
     }
 
@@ -1417,8 +1470,8 @@ mod tests {
     fn test_float_precision_coordinates() {
         // GPS coordinates: 4-5 decimal places
         let mut values = vec![
-            35.6762, 139.6503, 35.6812, 139.7671, 35.7100, 139.8107, 35.6585, 139.7454,
-            35.6896, 139.6917, 35.7023, 139.7745,
+            35.6762, 139.6503, 35.6812, 139.7671, 35.7100, 139.8107, 35.6585, 139.7454, 35.6896,
+            139.6917, 35.7023, 139.7745,
         ];
         let (precision, exponential) = compute_float_precision(&mut values);
         assert!(
@@ -1460,8 +1513,8 @@ mod tests {
     fn test_float_precision_proportions() {
         // Proportions stored with 6 digits but only needing 2 to distinguish
         let mut values = vec![
-            0.916667, 0.083333, 0.750000, 0.250000, 0.666667, 0.333333,
-            0.833333, 0.166667, 0.583333, 0.416667,
+            0.916667, 0.083333, 0.750000, 0.250000, 0.666667, 0.333333, 0.833333, 0.166667,
+            0.583333, 0.416667,
         ];
         let (precision, exponential) = compute_float_precision(&mut values);
         assert!(
@@ -1643,11 +1696,9 @@ mod tests {
             )
         };
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(list_array) as Arc<dyn Array>],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(list_array) as Arc<dyn Array>])
+                .unwrap();
 
         let mut source = MockSource::new(schema, vec![batch]);
         let layout = Layout::compute(&mut source);
@@ -1655,12 +1706,10 @@ mod tests {
 
         match &spec.root.kind {
             RenderSpecKind::Struct { children, .. } => match &children[0].1.kind {
-                RenderSpecKind::List { element } => {
-                    match &element.kind {
-                        RenderSpecKind::Scalar => {}
-                        _ => panic!("list element should be Scalar"),
-                    }
-                }
+                RenderSpecKind::List { element } => match &element.kind {
+                    RenderSpecKind::Scalar => {}
+                    _ => panic!("list element should be Scalar"),
+                },
                 _ => panic!("nums should be List"),
             },
             _ => panic!("root should be Struct"),

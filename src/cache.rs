@@ -35,9 +35,7 @@ impl<K: std::hash::Hash + Eq + Clone, V> SizedLruCache<K, V> {
             self.current_bytes -= old_size;
         }
 
-        while self.current_bytes + size > self.max_bytes
-            && self.entries.len() >= self.min_items
-        {
+        while self.current_bytes + size > self.max_bytes && self.entries.len() >= self.min_items {
             if let Some((evicted_key, evicted_size)) = self.sizes.pop_lru() {
                 self.entries.pop(&evicted_key);
                 self.current_bytes -= evicted_size;
@@ -70,7 +68,10 @@ pub struct RowCache {
 impl RowCache {
     pub fn new() -> Self {
         RowCache {
-            inner: RwLock::new(SizedLruCache::new(RENDERED_CACHE_BUDGET, RENDERED_CACHE_MIN_ITEMS)),
+            inner: RwLock::new(SizedLruCache::new(
+                RENDERED_CACHE_BUDGET,
+                RENDERED_CACHE_MIN_ITEMS,
+            )),
         }
     }
 

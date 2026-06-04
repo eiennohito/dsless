@@ -140,7 +140,11 @@ mod tests {
     }
 
     fn ctx<'a>(heights: &'a dyn RowHeightProvider, total_rows: usize) -> NavContext<'a> {
-        NavContext { heights, total_rows, visible_height: 10 }
+        NavContext {
+            heights,
+            total_rows,
+            visible_height: 10,
+        }
     }
 
     #[test]
@@ -173,7 +177,10 @@ mod tests {
     #[test]
     fn scroll_up_within_row() {
         let h = FakeHeights([(0, 5)].into());
-        let mut anchor = ViewportAnchor { row: 0, line_offset: 3 };
+        let mut anchor = ViewportAnchor {
+            row: 0,
+            line_offset: 3,
+        };
         anchor.apply(NavIntent::Scroll(-2), &ctx(&h, 1));
         assert_eq!(anchor.row(), 0);
         assert_eq!(anchor.line_offset(), 1);
@@ -182,7 +189,10 @@ mod tests {
     #[test]
     fn scroll_up_crosses_row_boundary() {
         let h = FakeHeights([(0, 3), (1, 5)].into());
-        let mut anchor = ViewportAnchor { row: 1, line_offset: 0 };
+        let mut anchor = ViewportAnchor {
+            row: 1,
+            line_offset: 0,
+        };
         anchor.apply(NavIntent::Scroll(-2), &ctx(&h, 2));
         assert_eq!(anchor.row(), 0);
         assert_eq!(anchor.line_offset(), 1);
@@ -191,7 +201,10 @@ mod tests {
     #[test]
     fn scroll_up_stops_at_top() {
         let h = FakeHeights([(0, 3)].into());
-        let mut anchor = ViewportAnchor { row: 0, line_offset: 1 };
+        let mut anchor = ViewportAnchor {
+            row: 0,
+            line_offset: 1,
+        };
         anchor.apply(NavIntent::Scroll(-100), &ctx(&h, 1));
         assert_eq!(anchor.row(), 0);
         assert_eq!(anchor.line_offset(), 0);
@@ -200,7 +213,10 @@ mod tests {
     #[test]
     fn scroll_down_stops_at_end() {
         let h = FakeHeights([(0, 1), (1, 1), (2, 1)].into());
-        let mut anchor = ViewportAnchor { row: 2, line_offset: 0 };
+        let mut anchor = ViewportAnchor {
+            row: 2,
+            line_offset: 0,
+        };
         anchor.apply(NavIntent::Scroll(10), &ctx(&h, 3));
         assert_eq!(anchor.row(), 2);
     }
@@ -225,7 +241,10 @@ mod tests {
     #[test]
     fn prev_record_resets_offset() {
         let h = FakeHeights(HashMap::new());
-        let mut anchor = ViewportAnchor { row: 5, line_offset: 3 };
+        let mut anchor = ViewportAnchor {
+            row: 5,
+            line_offset: 3,
+        };
         anchor.apply(NavIntent::PrevRecordBoundary, &ctx(&h, 10));
         assert_eq!(anchor.row(), 5);
         assert_eq!(anchor.line_offset(), 0);
@@ -234,7 +253,10 @@ mod tests {
     #[test]
     fn prev_record_at_start_goes_back() {
         let h = FakeHeights(HashMap::new());
-        let mut anchor = ViewportAnchor { row: 5, line_offset: 0 };
+        let mut anchor = ViewportAnchor {
+            row: 5,
+            line_offset: 0,
+        };
         anchor.apply(NavIntent::PrevRecordBoundary, &ctx(&h, 10));
         assert_eq!(anchor.row(), 4);
         assert_eq!(anchor.line_offset(), 0);
@@ -243,7 +265,10 @@ mod tests {
     #[test]
     fn next_record_boundary() {
         let h = FakeHeights(HashMap::new());
-        let mut anchor = ViewportAnchor { row: 3, line_offset: 5 };
+        let mut anchor = ViewportAnchor {
+            row: 3,
+            line_offset: 5,
+        };
         anchor.apply(NavIntent::NextRecordBoundary, &ctx(&h, 10));
         assert_eq!(anchor.row(), 4);
         assert_eq!(anchor.line_offset(), 0);

@@ -8,7 +8,10 @@ use crate::source::DataSource;
 
 pub enum WorkerRequest {
     /// Render rows in `start..end`, skipping already-cached rows.
-    RenderRange { start: usize, end: usize },
+    RenderRange {
+        start: usize,
+        end: usize,
+    },
     /// Find records matching query, scanning from `scan_from`, up to `limit` matches.
     FindMatchingRecords {
         query: String,
@@ -62,7 +65,15 @@ pub fn worker_thread(
                 scan_from,
                 limit,
             } => {
-                do_search(&mut source, &spec, &query, scan_from, limit, &mut writer, &tx);
+                do_search(
+                    &mut source,
+                    &spec,
+                    &query,
+                    scan_from,
+                    limit,
+                    &mut writer,
+                    &tx,
+                );
             }
             WorkerRequest::Shutdown => break,
         }

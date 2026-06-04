@@ -82,9 +82,7 @@ impl ParquetSource {
     fn locate_row(&self, global_row: usize) -> (usize, usize, usize) {
         for (fi, file) in self.files.iter().enumerate() {
             for (ri, rg) in file.row_groups.iter().enumerate() {
-                if global_row >= rg.global_offset
-                    && global_row < rg.global_offset + rg.num_rows
-                {
+                if global_row >= rg.global_offset && global_row < rg.global_offset + rg.num_rows {
                     return (fi, ri, global_row - rg.global_offset);
                 }
             }
@@ -120,10 +118,9 @@ impl DataSource for ParquetSource {
         let entry = &self.files[file_idx];
         let file = std::fs::File::open(&entry.path)
             .with_context(|| format!("Failed to open {:?}", entry.path))?;
-        let reader =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?
-                .with_row_groups(vec![rg_idx])
-                .build()?;
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?
+            .with_row_groups(vec![rg_idx])
+            .build()?;
 
         let batches: Vec<RecordBatch> = reader
             .collect::<std::result::Result<_, _>>()
