@@ -60,6 +60,7 @@ const RENDERED_CACHE_BUDGET: usize = 4 * 1024 * 1024;
 const RENDERED_CACHE_MIN_ITEMS: usize = 200;
 
 use crate::render::RenderedRow;
+use crate::viewport::RowHeightProvider;
 
 /// Thread-safe rendered-row cache, keyed by global row index.
 pub struct RowCache {
@@ -93,5 +94,11 @@ impl RowCache {
 
     pub fn contains(&self, row: usize) -> bool {
         self.inner.read().ok().is_some_and(|c| c.contains(&row))
+    }
+}
+
+impl RowHeightProvider for RowCache {
+    fn line_count(&self, row: usize) -> Option<usize> {
+        self.get(row).map(|r| r.line_count())
     }
 }

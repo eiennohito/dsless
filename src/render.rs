@@ -7,6 +7,22 @@ use arrow::datatypes::DataType;
 use crate::layout::{RenderSpec, RenderSpecKind, RenderSpecNode};
 use crate::unicode::{display_width, truncate_to_width};
 
+pub fn render_record(
+    spec: &RenderSpec,
+    batch: &RecordBatch,
+    local_row: usize,
+    global_row: usize,
+    writer: &mut LineWriter,
+) -> RenderedRow {
+    writer.clear();
+    if !spec.is_table() {
+        let _ = write!(writer, "── Row {} ──", global_row);
+        writer.newline();
+    }
+    spec.render_row(batch, local_row, writer);
+    writer.finish()
+}
+
 impl RenderSpec {
     /// Render one data row. Dispatches to table or vertical based on the spec.
     pub fn render_row(&self, batch: &RecordBatch, row: usize, w: &mut LineWriter) {
@@ -698,5 +714,75 @@ pub(crate) fn list_offsets(array: &dyn Array, row: usize) -> (usize, usize, Arc<
             (o[row] as usize, o[row + 1] as usize, la.values().clone())
         }
         _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{Layout, RenderSpec};
+    use crate::source::DataSource;
+    use crate::source::test_support::FakeDataSource;
+
+    #[test]
+    fn render_table_row_contains_values() {
+        let mut source = FakeDataSource::two_columns(&[("alice", 42), ("bob", 7)]);
+        let layout = Layout::compute(&mut source);
+        let spec = RenderSpec::resolve(&layout, 80);
+        assert!(spec.is_table());
+
+        let mut writer = LineWriter::new();
+        source.ensure_loaded(0).unwrap();
+        let (batch, local_row) = source.get_row(0);
+        let rendered = render_record(&spec, batch, local_row, 0, &mut writer);
+
+        assert_eq!(rendered.line_count(), 1);
+        let line = rendered.line(0);
+        assert!(line.contains("alice"), "expected 'alice' in: {}", line);
+        assert!(line.contains("42"), "expected '42' in: {}", line);
+    }
+
+    #[test]
+    fn render_multiple_rows() {
+        let mut source = FakeDataSource::two_columns(&[("alice", 1), ("bob", 2), ("charlie", 3)]);
+        let layout = Layout::compute(&mut source);
+        let spec = RenderSpec::resolve(&layout, 80);
+
+        let mut writer = LineWriter::new();
+        for row in 0..3 {
+            source.ensure_loaded(row).unwrap();
+            let (batch, local_row) = source.get_row(row);
+            let rendered = render_record(&spec, batch, local_row, row, &mut writer);
+            assert_eq!(rendered.line_count(), 1);
+        }
+    }
+
+    #[test]
+    fn lines_iterator_matches_indexed_access() {
+        let mut source = FakeDataSource::two_columns(&[("x", 1)]);
+        let layout = Layout::compute(&mut source);
+        let spec = RenderSpec::resolve(&layout, 80);
+
+        let mut writer = LineWriter::new();
+        source.ensure_loaded(0).unwrap();
+        let (batch, local_row) = source.get_row(0);
+        let rendered = render_record(&spec, batch, local_row, 0, &mut writer);
+
+        let lines_vec: Vec<&str> = rendered.lines().collect();
+        for (i, line) in lines_vec.iter().enumerate() {
+            assert_eq!(*line, rendered.line(i));
+        }
+    }
+
+    #[test]
+    fn table_header_has_separator() {
+        let mut source = FakeDataSource::two_columns(&[("alice", 1)]);
+        let layout = Layout::compute(&mut source);
+        let spec = RenderSpec::resolve(&layout, 80);
+
+        let header = spec.render_table_header();
+        assert_eq!(header.len(), 2);
+        assert!(header[0].contains("│"), "header should have column separator");
+        assert!(header[1].contains("─┼─"), "separator row should have crossing");
     }
 }

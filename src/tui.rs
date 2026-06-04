@@ -6,94 +6,15 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
-use rustc_hash::FxHashSet;
 
 use crate::cache::RowCache;
 use crate::layout::{Layout, RenderSpec};
+use crate::search::SearchState;
 use crate::source::DataSource;
 use crate::viewport::{NavContext, NavIntent, ViewportAnchor};
 use crate::worker::{WorkerRequest, WorkerResponse, worker_thread};
 
 const SEARCH_BATCH_SIZE: usize = 100;
-
-// ============================================================
-// Search state
-// ============================================================
-
-struct SearchState {
-    query: String,
-    query_lower: String,
-    /// Matched record (row) indices, in dataset order (sorted).
-    matched_rows: Vec<usize>,
-    /// O(1) membership test for matched rows.
-    matched_set: FxHashSet<usize>,
-    /// True if the entire dataset has been scanned.
-    exhausted: bool,
-    /// Where the worker stopped scanning (for lazy continuation).
-    scan_cursor: usize,
-    /// Current position in matched_rows (the "active" match).
-    current_idx: usize,
-    /// Line indices within current record that match the query (level 2).
-    record_line_matches: Vec<usize>,
-}
-
-impl SearchState {
-    fn new(query: String) -> Self {
-        let query_lower = query.to_lowercase();
-        SearchState {
-            query,
-            query_lower,
-            matched_rows: Vec::new(),
-            matched_set: FxHashSet::default(),
-            exhausted: false,
-            scan_cursor: 0,
-            current_idx: 0,
-            record_line_matches: Vec::new(),
-        }
-    }
-
-    fn extend_matches(&mut self, matches: Vec<usize>) {
-        for &row in &matches {
-            self.matched_set.insert(row);
-        }
-        self.matched_rows.extend(matches);
-    }
-
-    fn match_count_display(&self) -> String {
-        if self.exhausted {
-            format!("{}", self.matched_rows.len())
-        } else {
-            format!("{}+", self.matched_rows.len())
-        }
-    }
-
-    fn update_record_matches(&mut self, cache: &RowCache, row: usize) {
-        self.record_line_matches.clear();
-        if let Some(rendered) = cache.get(row) {
-            for i in 0..rendered.line_count() {
-                if rendered.line(i).to_lowercase().contains(&self.query_lower) {
-                    self.record_line_matches.push(i);
-                }
-            }
-        }
-    }
-
-    /// Find the next match index past `last_visible_row`. Binary search since matched_rows is sorted.
-    fn next_after(&self, last_visible_row: usize) -> Option<usize> {
-        let idx = self.matched_rows.partition_point(|&r| r <= last_visible_row);
-        if idx < self.matched_rows.len() {
-            Some(idx)
-        } else {
-            None
-        }
-    }
-
-    /// Find the previous match index before `first_visible_row`.
-    fn prev_before(&self, first_visible_row: usize) -> Option<usize> {
-        let idx = self.matched_rows.partition_point(|&r| r < first_visible_row);
-        idx.checked_sub(1)
-    }
-}
 
 // ============================================================
 // TUI entry
@@ -234,9 +155,9 @@ fn run_app(
                             && let Some(&row) = s.matched_rows.first()
                         {
                             s.current_idx = 0;
-                            s.update_record_matches(&cache, row);
+                            s.update_record_matches(cache.get(row));
                             let match_line = s.record_line_matches.first().copied().unwrap_or(0);
-                            let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                            let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                             anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
                             worker_tx.send(render_range_for(row, visible_height, is_table, lookahead, total_rows))?;
                         }
@@ -437,34 +358,34 @@ fn run_app(
 
                 // --- Scroll ---
                 KeyCode::Char('j') | KeyCode::Down => {
-                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                     anchor.apply(NavIntent::Scroll(1), &ctx);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                     anchor.apply(NavIntent::Scroll(-1), &ctx);
                 }
                 KeyCode::Char('J') | KeyCode::PageDown => {
-                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                     anchor.apply(NavIntent::Scroll(visible_height as isize), &ctx);
                 }
                 KeyCode::Char('K') | KeyCode::PageUp => {
-                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                     anchor.apply(NavIntent::Scroll(-(visible_height as isize)), &ctx);
                 }
                 KeyCode::Char(' ')
                 | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                     anchor.apply(NavIntent::Scroll((visible_height / 2) as isize), &ctx);
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                     anchor.apply(NavIntent::Scroll(-((visible_height / 2) as isize)), &ctx);
                 }
 
                 // --- Record navigation ---
                 KeyCode::Char('g') => {
-                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                     match pending_count.take() {
                         Some(n) => {
                             let target = n.saturating_sub(1);
@@ -477,7 +398,7 @@ fn run_app(
                     }
                 }
                 KeyCode::Char('G') => {
-                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                     match pending_count.take() {
                         Some(n) => {
                             let target = n.saturating_sub(1);
@@ -497,7 +418,7 @@ fn run_app(
                         } else {
                             (total_rows.saturating_sub(1) * pct) / 100
                         };
-                        let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                        let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                         anchor.apply(NavIntent::JumpToRecord(target), &ctx);
                         worker_tx.send(render_range_for(anchor.row(), visible_height, is_table, lookahead, total_rows))?;
                     }
@@ -524,9 +445,9 @@ fn run_app(
                         if let Some(idx) = s.next_after(last_visible_row) {
                             s.current_idx = idx;
                             let row = s.matched_rows[idx];
-                            s.update_record_matches(&cache, row);
+                            s.update_record_matches(cache.get(row));
                             let match_line = s.record_line_matches.first().copied().unwrap_or(0);
-                            let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                            let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                             anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
                             worker_tx.send(render_range_for(row, visible_height, is_table, lookahead, total_rows))?;
                         } else if !s.exhausted {
@@ -544,9 +465,9 @@ fn run_app(
                         if let Some(idx) = s.prev_before(anchor.row()) {
                             s.current_idx = idx;
                             let row = s.matched_rows[idx];
-                            s.update_record_matches(&cache, row);
+                            s.update_record_matches(cache.get(row));
                             let match_line = s.record_line_matches.first().copied().unwrap_or(0);
-                            let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                            let ctx = NavContext { heights: &*cache, total_rows, visible_height };
                             anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
                             worker_tx.send(render_range_for(row, visible_height, is_table, lookahead, total_rows))?;
                         }

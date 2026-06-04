@@ -1,6 +1,7 @@
 mod cache;
 mod layout;
 mod render;
+mod search;
 mod source;
 mod tui;
 mod unicode;
@@ -61,19 +62,12 @@ fn run_pipe(mut source: Box<dyn DataSource>, max_rows: usize) -> Result<()> {
         }
     }
 
-    use std::fmt::Write;
     let mut writer = render::LineWriter::new();
     let total = source.total_rows().min(max_rows);
     for global_row in 0..total {
-        writer.clear();
-        if !is_table {
-            let _ = write!(writer, "── Row {} ──", global_row);
-            writer.newline();
-        }
         source.ensure_loaded(global_row)?;
         let (batch, local_row) = source.get_row(global_row);
-        spec.render_row(batch, local_row, &mut writer);
-        let rendered = writer.finish();
+        let rendered = render::render_record(&spec, batch, local_row, global_row, &mut writer);
         for line in rendered.lines() {
             println!("{}", line);
         }
