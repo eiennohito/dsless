@@ -62,16 +62,16 @@ jobs:
 
   build-linux-aarch64:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
-        run: cross build --release --target aarch64-unknown-linux-musl
+        run: cargo build --release --target aarch64-unknown-linux-musl
       - name: Create archive
         run: tar czf dsless-linux-aarch64.tar.gz -C target/aarch64-unknown-linux-musl/release dsless
       - uses: actions/upload-artifact@v4
