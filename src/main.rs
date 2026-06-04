@@ -16,7 +16,7 @@ use clap::Parser;
 use source::DataSource;
 
 #[derive(Parser)]
-#[command(name = "dsless", about = "A pager for data-science formats")]
+#[command(name = "dsless", about = "A pager for data-science formats", version)]
 struct Cli {
     /// Path to a parquet file or directory of parquet files
     path: PathBuf,
