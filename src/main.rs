@@ -4,6 +4,7 @@ mod render;
 mod source;
 mod tui;
 mod unicode;
+mod viewport;
 mod worker;
 
 use std::path::PathBuf;

@@ -11,6 +11,7 @@ use rustc_hash::FxHashSet;
 use crate::cache::RowCache;
 use crate::layout::{Layout, RenderSpec};
 use crate::source::DataSource;
+use crate::viewport::{NavContext, NavIntent, ViewportAnchor};
 use crate::worker::{WorkerRequest, WorkerResponse, worker_thread};
 
 const SEARCH_BATCH_SIZE: usize = 100;
@@ -196,12 +197,10 @@ fn run_app(
     let mut visible_height = initial_size.height.saturating_sub(3) as usize;
     worker_tx.send(render_range_for(0, visible_height, is_table, lookahead, total_rows))?;
 
-    let mut current_row: usize = 0;
-    let mut line_offset: usize = 0;
+    let mut anchor = ViewportAnchor::top();
     let mut pending_count: Option<usize> = None;
-    let mut input_buf = String::new(); // for search input
+    let mut input_buf = String::new();
     let mut input_mode = false;
-    let mut show_header = true;
     let mut show_help = false;
 
     let mut search: Option<SearchState> = None;
@@ -231,20 +230,14 @@ fn run_app(
                         s.exhausted = exhausted;
                         s.scan_cursor = scanned_up_to;
 
-                        // On first batch, navigate to first match
                         if first_batch
                             && let Some(&row) = s.matched_rows.first()
                         {
                             s.current_idx = 0;
-                            navigate_to_match(
-                                &cache,
-                                s,
-                                row,
-                                &mut current_row,
-                                &mut line_offset,
-                                visible_height,
-                            );
-                            show_header = false;
+                            s.update_record_matches(&cache, row);
+                            let match_line = s.record_line_matches.first().copied().unwrap_or(0);
+                            let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                            anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
                             worker_tx.send(render_range_for(row, visible_height, is_table, lookahead, total_rows))?;
                         }
                     }
@@ -264,9 +257,7 @@ fn run_app(
             let mut display: Vec<Line> = Vec::with_capacity(visible_height);
             let mut lines_remaining = visible_height;
 
-            // Table layout: always show column headers (sticky)
-            // Vertical layout: show schema header only at top
-            if is_table || (show_header && current_row == 0 && line_offset == 0) {
+            if is_table || anchor.is_at_top() {
                 for hline in &schema_header {
                     if lines_remaining == 0 {
                         break;
@@ -279,9 +270,8 @@ fn run_app(
                 }
             }
 
-            let mut row = current_row;
-            let mut skip =
-                if current_row == 0 && line_offset == 0 && show_header { 0 } else { line_offset };
+            let mut row = anchor.row();
+            let mut skip = if anchor.is_at_top() { 0 } else { anchor.line_offset() };
 
             while lines_remaining > 0 && row < total_rows {
                 if let Some(rendered) = cache.get(row) {
@@ -322,7 +312,7 @@ fn run_app(
                 let pct = if total_rows == 0 {
                     100
                 } else {
-                    (current_row + 1) * 100 / total_rows
+                    (anchor.row() + 1) * 100 / total_rows
                 };
                 let count_str = pending_count.map_or(String::new(), |n| format!("{}", n));
                 let search_info = if let Some(ref s) = search {
@@ -339,7 +329,7 @@ fn run_app(
                 format!(
                     "{}Row {}/{} ({}){}",
                     count_str,
-                    current_row + 1,
+                    anchor.row() + 1,
                     total_rows,
                     pct,
                     search_info,
@@ -353,7 +343,7 @@ fn run_app(
             let paragraph = Paragraph::new(display).block(block);
             frame.render_widget(paragraph, area);
 
-            let mut scrollbar_state = ScrollbarState::new(total_rows).position(current_row);
+            let mut scrollbar_state = ScrollbarState::new(total_rows).position(anchor.row());
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
             frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
 
@@ -369,7 +359,7 @@ fn run_app(
             // covers all missing rows.
             let end = last_visible_row + 1 + lookahead;
             worker_tx.send(WorkerRequest::RenderRange {
-                start: current_row,
+                start: anchor.row(),
                 end: end.min(total_rows),
             })?;
         }
@@ -391,7 +381,7 @@ fn run_app(
                 };
                 cache.clear();
                 worker_tx.send(WorkerRequest::UpdateSpec(Arc::clone(&spec)))?;
-                worker_tx.send(render_range_for(current_row, visible_height, is_table, lookahead, total_rows))?;
+                worker_tx.send(render_range_for(anchor.row(), visible_height, is_table, lookahead, total_rows))?;
             }
         }
         Event::Key(key) => {
@@ -445,99 +435,60 @@ fn run_app(
                     break;
                 }
 
-                // --- Line scroll ---
+                // --- Scroll ---
                 KeyCode::Char('j') | KeyCode::Down => {
-                    scroll_down(&cache, &mut current_row, &mut line_offset, 1, total_rows);
-                    show_header = false;
+                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    anchor.apply(NavIntent::Scroll(1), &ctx);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    scroll_up(&cache, &mut current_row, &mut line_offset, 1);
-                    if current_row == 0 && line_offset == 0 {
-                        show_header = true;
-                    }
+                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    anchor.apply(NavIntent::Scroll(-1), &ctx);
                 }
-
-                // --- Page scroll ---
                 KeyCode::Char('J') | KeyCode::PageDown => {
-                    scroll_down(
-                        &cache,
-                        &mut current_row,
-                        &mut line_offset,
-                        visible_height,
-                        total_rows,
-                    );
-                    show_header = false;
+                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    anchor.apply(NavIntent::Scroll(visible_height as isize), &ctx);
                 }
                 KeyCode::Char('K') | KeyCode::PageUp => {
-                    scroll_up(&cache, &mut current_row, &mut line_offset, visible_height);
-                    if current_row == 0 && line_offset == 0 {
-                        show_header = true;
-                    }
+                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    anchor.apply(NavIntent::Scroll(-(visible_height as isize)), &ctx);
                 }
-
-                // --- Half-page scroll ---
                 KeyCode::Char(' ')
                 | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    scroll_down(
-                        &cache,
-                        &mut current_row,
-                        &mut line_offset,
-                        visible_height / 2,
-                        total_rows,
-                    );
-                    show_header = false;
+                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    anchor.apply(NavIntent::Scroll((visible_height / 2) as isize), &ctx);
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    scroll_up(
-                        &cache,
-                        &mut current_row,
-                        &mut line_offset,
-                        visible_height / 2,
-                    );
-                    if current_row == 0 && line_offset == 0 {
-                        show_header = true;
-                    }
+                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                    anchor.apply(NavIntent::Scroll(-((visible_height / 2) as isize)), &ctx);
                 }
 
                 // --- Record navigation ---
                 KeyCode::Char('g') => {
+                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
                     match pending_count.take() {
                         Some(n) => {
-                            let target = n.saturating_sub(1).min(total_rows.saturating_sub(1));
-                            current_row = target;
-                            line_offset = 0;
-                            show_header = target == 0;
-                            worker_tx.send(render_range_for(target, visible_height, is_table, lookahead, total_rows))?;
+                            let target = n.saturating_sub(1);
+                            anchor.apply(NavIntent::JumpToRecord(target), &ctx);
+                            worker_tx.send(render_range_for(anchor.row(), visible_height, is_table, lookahead, total_rows))?;
                         }
                         None => {
-                            if line_offset == 0 && current_row > 0 {
-                                current_row -= 1;
-                            }
-                            line_offset = 0;
-                            show_header = current_row == 0;
+                            anchor.apply(NavIntent::PrevRecordBoundary, &ctx);
                         }
                     }
                 }
                 KeyCode::Char('G') => {
+                    let ctx = NavContext { cache: &cache, total_rows, visible_height };
                     match pending_count.take() {
                         Some(n) => {
-                            let target = n.saturating_sub(1).min(total_rows.saturating_sub(1));
-                            current_row = target;
-                            line_offset = 0;
-                            show_header = target == 0;
-                            worker_tx.send(render_range_for(target, visible_height, is_table, lookahead, total_rows))?;
+                            let target = n.saturating_sub(1);
+                            anchor.apply(NavIntent::JumpToRecord(target), &ctx);
+                            worker_tx.send(render_range_for(anchor.row(), visible_height, is_table, lookahead, total_rows))?;
                         }
                         None => {
-                            if current_row + 1 < total_rows {
-                                current_row += 1;
-                                line_offset = 0;
-                                show_header = false;
-                            }
+                            anchor.apply(NavIntent::NextRecordBoundary, &ctx);
                         }
                     }
                 }
-
-                // --- Percentage jump ---
                 KeyCode::Char('%') => {
                     if let Some(n) = pending_count.take() {
                         let pct = n.min(100);
@@ -546,10 +497,9 @@ fn run_app(
                         } else {
                             (total_rows.saturating_sub(1) * pct) / 100
                         };
-                        current_row = target;
-                        line_offset = 0;
-                        show_header = target == 0;
-                        worker_tx.send(render_range_for(target, visible_height, is_table, lookahead, total_rows))?;
+                        let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                        anchor.apply(NavIntent::JumpToRecord(target), &ctx);
+                        worker_tx.send(render_range_for(anchor.row(), visible_height, is_table, lookahead, total_rows))?;
                     }
                 }
 
@@ -571,22 +521,15 @@ fn run_app(
                 }
                 KeyCode::Char('n') => {
                     if let Some(ref mut s) = search {
-                        // Find next match past the current screen
                         if let Some(idx) = s.next_after(last_visible_row) {
                             s.current_idx = idx;
                             let row = s.matched_rows[idx];
-                            navigate_to_match(
-                                &cache,
-                                s,
-                                row,
-                                &mut current_row,
-                                &mut line_offset,
-                                visible_height,
-                            );
-                            show_header = false;
+                            s.update_record_matches(&cache, row);
+                            let match_line = s.record_line_matches.first().copied().unwrap_or(0);
+                            let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                            anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
                             worker_tx.send(render_range_for(row, visible_height, is_table, lookahead, total_rows))?;
                         } else if !s.exhausted {
-                            // Need more matches from worker
                             searching = true;
                             worker_tx.send(WorkerRequest::FindMatchingRecords {
                                 query: s.query.clone(),
@@ -598,19 +541,13 @@ fn run_app(
                 }
                 KeyCode::Char('N') => {
                     if let Some(ref mut s) = search {
-                        // Find previous match before the current screen
-                        if let Some(idx) = s.prev_before(current_row) {
+                        if let Some(idx) = s.prev_before(anchor.row()) {
                             s.current_idx = idx;
                             let row = s.matched_rows[idx];
-                            navigate_to_match(
-                                &cache,
-                                s,
-                                row,
-                                &mut current_row,
-                                &mut line_offset,
-                                visible_height,
-                            );
-                            show_header = current_row == 0;
+                            s.update_record_matches(&cache, row);
+                            let match_line = s.record_line_matches.first().copied().unwrap_or(0);
+                            let ctx = NavContext { cache: &cache, total_rows, visible_height };
+                            anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
                             worker_tx.send(render_range_for(row, visible_height, is_table, lookahead, total_rows))?;
                         }
                     }
@@ -630,7 +567,7 @@ fn run_app(
             }
 
             pending_count = None;
-            worker_tx.send(render_range_for(current_row, visible_height, is_table, lookahead, total_rows))?;
+            worker_tx.send(render_range_for(anchor.row(), visible_height, is_table, lookahead, total_rows))?;
         }
         _ => {}
         }
@@ -690,32 +627,6 @@ fn render_help_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
 }
 
 // ============================================================
-// Search navigation
-// ============================================================
-
-/// Navigate to a matched record, positioning the first matching line at 20% from top.
-fn navigate_to_match(
-    cache: &RowCache,
-    search: &mut SearchState,
-    row: usize,
-    current_row: &mut usize,
-    line_offset: &mut usize,
-    visible_height: usize,
-) {
-    *current_row = row;
-    *line_offset = 0;
-
-    // Update level-2 matches
-    search.update_record_matches(cache, row);
-
-    // Position first matching line at 20% from top
-    if let Some(&first_match_line) = search.record_line_matches.first() {
-        let target_offset = visible_height / 5;
-        *line_offset = first_match_line.saturating_sub(target_offset);
-    }
-}
-
-// ============================================================
 // Line styling
 // ============================================================
 
@@ -749,70 +660,3 @@ fn style_line<'a>(line: &str, row: usize, search: &Option<SearchState>) -> Line<
     }
 }
 
-// ============================================================
-// Scroll helpers
-// ============================================================
-
-fn row_line_count(cache: &RowCache, row: usize) -> Option<usize> {
-    cache.get(row).map(|r| r.line_count())
-}
-
-fn scroll_down(
-    cache: &RowCache,
-    current_row: &mut usize,
-    line_offset: &mut usize,
-    count: usize,
-    total_rows: usize,
-) {
-    let mut remaining = count;
-    while remaining > 0 {
-        if let Some(row_lines) = row_line_count(cache, *current_row) {
-            let lines_below = row_lines.saturating_sub(*line_offset);
-            if remaining < lines_below {
-                *line_offset += remaining;
-                return;
-            }
-            remaining -= lines_below;
-            if *current_row + 1 < total_rows {
-                *current_row += 1;
-                *line_offset = 0;
-            } else {
-                *line_offset = row_lines.saturating_sub(1);
-                return;
-            }
-        } else {
-            if *current_row + 1 < total_rows {
-                *current_row += 1;
-                *line_offset = 0;
-            }
-            return;
-        }
-    }
-}
-
-fn scroll_up(
-    cache: &RowCache,
-    current_row: &mut usize,
-    line_offset: &mut usize,
-    count: usize,
-) {
-    let mut remaining = count;
-    while remaining > 0 {
-        if *line_offset >= remaining {
-            *line_offset -= remaining;
-            return;
-        }
-        remaining -= *line_offset;
-        if *current_row == 0 {
-            *line_offset = 0;
-            return;
-        }
-        *current_row -= 1;
-        if let Some(row_lines) = row_line_count(cache, *current_row) {
-            *line_offset = row_lines.saturating_sub(1);
-        } else {
-            *line_offset = 0;
-            return;
-        }
-    }
-}
