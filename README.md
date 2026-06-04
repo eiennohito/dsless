@@ -5,9 +5,12 @@ A terminal pager for data-science file formats. Think `less`, but for parquet fi
 ## TL;DR
 
 ```bash
-cargo install --path .
+# Install binary
+curl -fsSL https://raw.githubusercontent.com/eiennohito/dsless/main/install.sh | sh
+
 dsless data.parquet          # TUI mode
 dsless parquet-dir/           # reads all .parquet files in directory
+dsless data.jsonl             # JSONL/NDJSON files
 dsless data.parquet | head    # pipe mode, plain text output
 ```
 
@@ -38,17 +41,28 @@ Existing tools (`parquet-tools`, `duckdb`, pandas) choke on complex nested schem
 
 ## Installation
 
+### Binary (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eiennohito/dsless/main/install.sh | sh
+```
+
+Installs to `~/.local/bin` by default. Override with `DSLESS_INSTALL_DIR`:
+
+```bash
+DSLESS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/eiennohito/dsless/main/install.sh | sh
+```
+
+Supports macOS (universal), Linux x86_64, and Linux aarch64.
+
+### From source
+
 Requires Rust 1.85+.
 
 ```bash
-# From source
-git clone <repo>
+git clone https://github.com/eiennohito/dsless.git
 cd dsless
 cargo install --path .
-
-# Or just build
-cargo build --release
-# Binary at target/release/dsless
 ```
 
 ## Usage
@@ -98,5 +112,6 @@ Status bar shows: `/{query}: {N} records, {M} in record`
 ## Supported formats
 
 - **Parquet** (`.parquet`) — including zstd/snappy/gzip compression, partitioned directories
+- **JSONL/NDJSON** (`.jsonl`, `.ndjson`) — newline-delimited JSON
 
-Planned: JSONL, ORC, CSV.
+Planned: ORC, CSV.

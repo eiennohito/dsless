@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+
+  build-macos:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build aarch64
+        run: cargo build --release --target aarch64-apple-darwin
+      - name: Build x86_64
+        run: cargo build --release --target x86_64-apple-darwin
+      - name: Create universal binary
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/dsless \
+            target/x86_64-apple-darwin/release/dsless \
+            -output dsless
+      - name: Create archive
+        run: tar czf dsless-darwin-universal.tar.gz dsless
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsless-darwin-universal
+          path: dsless-darwin-universal.tar.gz
+
+  build-linux-x86_64:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Create archive
+        run: tar czf dsless-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-musl/release dsless
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsless-linux-x86_64
+          path: dsless-linux-x86_64.tar.gz
+
+  build-linux-aarch64:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build
+        run: cross build --release --target aarch64-unknown-linux-musl
+      - name: Create archive
+        run: tar czf dsless-linux-aarch64.tar.gz -C target/aarch64-unknown-linux-musl/release dsless
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsless-linux-aarch64
+          path: dsless-linux-aarch64.tar.gz
+
+  release:
+    needs: [build-macos, build-linux-x86_64, build-linux-aarch64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft \
+            --generate-notes \
+            dsless-darwin-universal.tar.gz \
+            dsless-linux-x86_64.tar.gz \
+            dsless-linux-aarch64.tar.gz
