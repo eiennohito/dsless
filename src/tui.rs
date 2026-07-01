@@ -3,13 +3,14 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
 use crate::cache::RowCache;
+use crate::input::{Action, InputHandler, Mode};
 use crate::layout::{Layout, RenderSpec};
 use crate::search::SearchState;
 use crate::source::DataSource;
@@ -137,10 +138,7 @@ fn run_app(
     ))?;
 
     let mut anchor = ViewportAnchor::top();
-    let mut pending_count: Option<usize> = None;
-    let mut input_buf = String::new();
-    let mut input_mode = false;
-    let mut show_help = false;
+    let mut input = InputHandler::new();
 
     let mut search: Option<SearchState> = None;
     let mut searching = false; // worker is currently scanning
@@ -253,8 +251,8 @@ fn run_app(
             }
 
             // Status bar
-            let status = if input_mode {
-                format!("/{}  ", input_buf)
+            let status = if input.mode() == Mode::Search {
+                format!("/{}  ", input.search_query())
             } else if searching {
                 let prog = search_progress.map_or(String::new(), |r| format!(" (at row {})", r));
                 format!("Searching...{}", prog)
@@ -264,7 +262,7 @@ fn run_app(
                 } else {
                     (anchor.row() + 1) * 100 / total_rows
                 };
-                let count_str = pending_count.map_or(String::new(), |n| format!("{}", n));
+                let count_str = input.pending_count().map_or(String::new(), |n| format!("{}", n));
                 let search_info = if let Some(ref s) = search {
                     let record_matches = s.record_line_matches.len();
                     format!(
@@ -297,7 +295,7 @@ fn run_app(
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
             frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
 
-            if show_help {
+            if input.mode() == Mode::Help {
                 render_help_popup(frame, area);
             }
         })?;
@@ -341,196 +339,75 @@ fn run_app(
                 }
             }
             Event::Key(key) => {
-                // Help popup intercepts all keys
-                if show_help {
-                    show_help = false;
-                    continue;
-                }
+                input.set_has_active_search(search.is_some());
+                let action = input.handle(key);
 
-                if input_mode {
-                    match key.code {
-                        KeyCode::Enter => {
-                            input_mode = false;
-                            if !input_buf.is_empty() {
-                                let query = input_buf.clone();
-                                let mut s = SearchState::new(query.clone());
-                                s.scan_cursor = 0;
-                                search = Some(s);
-                                searching = true;
-                                worker_tx.send(WorkerRequest::FindMatchingRecords {
-                                    query,
-                                    scan_from: 0,
-                                    limit: SEARCH_BATCH_SIZE,
-                                })?;
-                            }
-                        }
-                        KeyCode::Esc => {
-                            input_mode = false;
-                            input_buf.clear();
-                        }
-                        KeyCode::Backspace => {
-                            input_buf.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            input_buf.push(c);
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
+                let ctx = NavContext {
+                    heights: &*cache,
+                    total_rows,
+                    visible_height,
+                };
 
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => {
-                        let _ = worker_tx.send(WorkerRequest::Shutdown);
-                        let _ = worker_handle.join();
-                        break;
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match action {
+                    Action::None => continue,
+
+                    Action::Quit => {
                         let _ = worker_tx.send(WorkerRequest::Shutdown);
                         let _ = worker_handle.join();
                         break;
                     }
 
                     // --- Scroll ---
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        let ctx = NavContext {
-                            heights: &*cache,
-                            total_rows,
-                            visible_height,
-                        };
-                        anchor.apply(NavIntent::Scroll(1), &ctx);
+                    Action::ScrollLines(n) => {
+                        anchor.apply(NavIntent::Scroll(n), &ctx);
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        let ctx = NavContext {
-                            heights: &*cache,
-                            total_rows,
-                            visible_height,
-                        };
-                        anchor.apply(NavIntent::Scroll(-1), &ctx);
+                    Action::ScrollPage(n) => {
+                        anchor.apply(NavIntent::Scroll(n * visible_height as isize), &ctx);
                     }
-                    KeyCode::Char('J') | KeyCode::PageDown => {
-                        let ctx = NavContext {
-                            heights: &*cache,
-                            total_rows,
-                            visible_height,
-                        };
-                        anchor.apply(NavIntent::Scroll(visible_height as isize), &ctx);
-                    }
-                    KeyCode::Char('K') | KeyCode::PageUp => {
-                        let ctx = NavContext {
-                            heights: &*cache,
-                            total_rows,
-                            visible_height,
-                        };
-                        anchor.apply(NavIntent::Scroll(-(visible_height as isize)), &ctx);
-                    }
-                    KeyCode::Char(' ') | KeyCode::Char('d')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        let ctx = NavContext {
-                            heights: &*cache,
-                            total_rows,
-                            visible_height,
-                        };
-                        anchor.apply(NavIntent::Scroll((visible_height / 2) as isize), &ctx);
-                    }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let ctx = NavContext {
-                            heights: &*cache,
-                            total_rows,
-                            visible_height,
-                        };
-                        anchor.apply(NavIntent::Scroll(-((visible_height / 2) as isize)), &ctx);
+                    Action::ScrollHalfPage(n) => {
+                        anchor.apply(
+                            NavIntent::Scroll(n * (visible_height / 2) as isize),
+                            &ctx,
+                        );
                     }
 
                     // --- Record navigation ---
-                    KeyCode::Char('g') => {
-                        let ctx = NavContext {
-                            heights: &*cache,
-                            total_rows,
-                            visible_height,
+                    Action::PrevRecord => {
+                        anchor.apply(NavIntent::PrevRecordBoundary, &ctx);
+                    }
+                    Action::NextRecord => {
+                        anchor.apply(NavIntent::NextRecordBoundary, &ctx);
+                    }
+                    Action::JumpToRecord(target) => {
+                        anchor.apply(NavIntent::JumpToRecord(target), &ctx);
+                    }
+                    Action::JumpPercent(n) => {
+                        let pct = n.min(100);
+                        let target = if total_rows == 0 {
+                            0
+                        } else {
+                            (total_rows.saturating_sub(1) * pct) / 100
                         };
-                        match pending_count.take() {
-                            Some(n) => {
-                                let target = n.saturating_sub(1);
-                                anchor.apply(NavIntent::JumpToRecord(target), &ctx);
-                                worker_tx.send(render_range_for(
-                                    anchor.row(),
-                                    visible_height,
-                                    is_table,
-                                    lookahead,
-                                    total_rows,
-                                ))?;
-                            }
-                            None => {
-                                anchor.apply(NavIntent::PrevRecordBoundary, &ctx);
-                            }
-                        }
-                    }
-                    KeyCode::Char('G') => {
-                        let ctx = NavContext {
-                            heights: &*cache,
-                            total_rows,
-                            visible_height,
-                        };
-                        match pending_count.take() {
-                            Some(n) => {
-                                let target = n.saturating_sub(1);
-                                anchor.apply(NavIntent::JumpToRecord(target), &ctx);
-                                worker_tx.send(render_range_for(
-                                    anchor.row(),
-                                    visible_height,
-                                    is_table,
-                                    lookahead,
-                                    total_rows,
-                                ))?;
-                            }
-                            None => {
-                                anchor.apply(NavIntent::NextRecordBoundary, &ctx);
-                            }
-                        }
-                    }
-                    KeyCode::Char('%') => {
-                        if let Some(n) = pending_count.take() {
-                            let pct = n.min(100);
-                            let target = if total_rows == 0 {
-                                0
-                            } else {
-                                (total_rows.saturating_sub(1) * pct) / 100
-                            };
-                            let ctx = NavContext {
-                                heights: &*cache,
-                                total_rows,
-                                visible_height,
-                            };
-                            anchor.apply(NavIntent::JumpToRecord(target), &ctx);
-                            worker_tx.send(render_range_for(
-                                anchor.row(),
-                                visible_height,
-                                is_table,
-                                lookahead,
-                                total_rows,
-                            ))?;
-                        }
-                    }
-
-                    // --- Numeric prefix ---
-                    KeyCode::Char(c @ '1'..='9') => {
-                        let digit = c as usize - '0' as usize;
-                        pending_count = Some(pending_count.unwrap_or(0) * 10 + digit);
-                        continue;
-                    }
-                    KeyCode::Char('0') if pending_count.is_some() => {
-                        pending_count = Some(pending_count.unwrap() * 10);
-                        continue;
+                        anchor.apply(NavIntent::JumpToRecord(target), &ctx);
                     }
 
                     // --- Search ---
-                    KeyCode::Char('/') => {
-                        input_mode = true;
-                        input_buf.clear();
+                    Action::EnterSearch | Action::SearchQueryChanged => {}
+                    Action::SubmitSearch(query) => {
+                        if !query.is_empty() {
+                            let mut s = SearchState::new(query.clone());
+                            s.scan_cursor = 0;
+                            search = Some(s);
+                            searching = true;
+                            worker_tx.send(WorkerRequest::FindMatchingRecords {
+                                query,
+                                scan_from: 0,
+                                limit: SEARCH_BATCH_SIZE,
+                            })?;
+                        }
                     }
-                    KeyCode::Char('n') => {
+                    Action::CancelSearch => {}
+                    Action::SearchNext => {
                         if let Some(ref mut s) = search {
                             if let Some(idx) = s.next_after(last_visible_row) {
                                 s.current_idx = idx;
@@ -538,11 +415,6 @@ fn run_app(
                                 s.update_record_matches(cache.get(row));
                                 let match_line =
                                     s.record_line_matches.first().copied().unwrap_or(0);
-                                let ctx = NavContext {
-                                    heights: &*cache,
-                                    total_rows,
-                                    visible_height,
-                                };
                                 anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
                                 worker_tx.send(render_range_for(
                                     row,
@@ -561,7 +433,7 @@ fn run_app(
                             }
                         }
                     }
-                    KeyCode::Char('N') => {
+                    Action::SearchPrev => {
                         if let Some(ref mut s) = search {
                             if let Some(idx) = s.prev_before(anchor.row()) {
                                 s.current_idx = idx;
@@ -569,11 +441,6 @@ fn run_app(
                                 s.update_record_matches(cache.get(row));
                                 let match_line =
                                     s.record_line_matches.first().copied().unwrap_or(0);
-                                let ctx = NavContext {
-                                    heights: &*cache,
-                                    total_rows,
-                                    visible_height,
-                                };
                                 anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
                                 worker_tx.send(render_range_for(
                                     row,
@@ -585,21 +452,26 @@ fn run_app(
                             }
                         }
                     }
-                    KeyCode::Esc => {
-                        // Clear search
+                    Action::DismissOverlay => {
                         search = None;
                         searching = false;
                         search_progress = None;
                     }
 
-                    KeyCode::Char('?') => {
-                        show_help = true;
-                    }
+                    Action::ShowHelp | Action::DismissHelp => {}
 
-                    _ => {}
+                    // --- Cell cursor / preview: Phase 2/3 will consume these ---
+                    Action::CellLeft
+                    | Action::CellRight
+                    | Action::CursorRecordNext
+                    | Action::CursorRecordPrev
+                    | Action::ShowFieldNumbers
+                    | Action::PreviewField(_)
+                    | Action::RepeatPreview
+                    | Action::PreviewCursorCell
+                    | Action::PreviewScroll(_) => {}
                 }
 
-                pending_count = None;
                 worker_tx.send(render_range_for(
                     anchor.row(),
                     visible_height,
