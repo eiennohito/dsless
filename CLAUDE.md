@@ -52,6 +52,17 @@ This project uses Github Issues for plan tracking. Create issues using `gh` tool
 - **System docs** (`docs/`): High-level markdown covering *what* a subsystem does and *why* it exists. Implementation details belong in code; docs capture the reasoning that code can't express.
 - **Code comments**: Describe the *goal*, not the mechanism. "What this code does" should be obvious from reading it; if it isn't, the comment should state the high-level goal that justifies the complexity — not narrate the implementation. Code that is non-obvious *and* has no clear goal is a refactor target, not a comment target.
 
+## File organization (Rust)
+
+- **mod.rs is a barrel**: module declarations + re-exports only. No type definitions, no logic, no `#[cfg(test)]` blocks. Nothing that isn't a `mod`, `use`, or `pub use` statement. Types belong in the submodule that constructs them; shared test fixtures go in a dedicated file (e.g. `test_fixtures.rs`).
+- **Line thresholds apply to code** (exclude `#[cfg(test)]` blocks — tests stay with their source):
+  - ~500 LOC: healthy
+  - ~700 LOC: check for distinct responsibilities — if you find conceptual seams, split
+  - >1200 LOC: almost certainly needs splitting
+- **Check before growing, not just after**: when planning new functionality, check if the target file is already near ~700. If the addition would push it over, look for seams and split first.
+- **Structural fixes only**: if hitting a limit requires cosmetic workarounds (compressing comments, shortening names), either the limit is wrong for this case or the code structure is wrong. Diagnose which.
+- **Module listing** (in `docs/architecture.md`): one line per module, ≤50-char / ≤20-word description (whichever is smaller). Directory modules get one line with a description — no children listed.
+
 ## Architecture
 
 See [docs](./docs/architecture.md)

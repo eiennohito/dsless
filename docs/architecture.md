@@ -5,11 +5,9 @@
 ```
 src/
   main.rs              CLI parsing, pipe mode output
-  layout.rs            Layout computation + RenderSpec resolution
+  layout/              Two-layer display model: Layout + RenderSpec
   render.rs            Rendering methods on RenderSpec types
-  source/
-    mod.rs             DataSource trait + format dispatcher
-    parquet.rs         ParquetSource: lazy row-group loading
+  source/              DataSource trait + format implementations
   cache.rs             SizedLruCache, RowCache
   worker.rs            Background thread: rendering + search
   tui.rs               Terminal UI: draw loop, input, scroll
@@ -43,7 +41,7 @@ src/
 
 ## Two-layer display model
 
-All display decisions flow through two types in `layout.rs`:
+All display decisions flow through two types in the `layout/` module:
 
 ### Layout (durable, schema-derived)
 
