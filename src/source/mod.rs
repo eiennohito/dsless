@@ -1,6 +1,7 @@
 pub mod jsonl;
 pub mod parquet;
 
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -33,59 +34,91 @@ enum Format {
     Jsonl,
 }
 
-fn detect_format(path: &Path) -> Result<Format> {
+// Disambiguates format for routing, not validation. 8 bytes suffices:
+// Parquet files start with 4-byte magic "PAR1"; JSONL starts with '{' or '['.
+fn sniff_format(path: &Path) -> Result<Option<Format>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 8];
+    let n = file.read(&mut buf)?;
+    if n >= 4 && buf[..4] == *b"PAR1" {
+        return Ok(Some(Format::Parquet));
+    }
+    let start = if n >= 3 && buf[..3] == [0xEF, 0xBB, 0xBF] {
+        3
+    } else {
+        0
+    };
+    for &b in &buf[start..n] {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'{' || b == b'[' {
+            return Ok(Some(Format::Jsonl));
+        }
+        break;
+    }
+    Ok(None)
+}
+
+fn classify_path(path: &Path) -> Result<(Format, Vec<std::path::PathBuf>)> {
     if path.is_file() {
-        return format_from_extension(path);
+        let format = sniff_format(path)?
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine format of {:?}: content not recognized as Parquet or JSONL", path))?;
+        return Ok((format, vec![path.to_path_buf()]));
     }
     if !path.is_dir() {
         anyhow::bail!("{:?} is not a file or directory", path);
     }
 
-    let mut has_parquet = false;
-    let mut has_jsonl = false;
+    let mut parquet_files = Vec::new();
+    let mut jsonl_files = Vec::new();
 
     for entry in std::fs::read_dir(path)?.filter_map(|e| e.ok()) {
-        match entry.path().extension().and_then(|e| e.to_str()) {
-            Some("parquet") => has_parquet = true,
-            Some("jsonl" | "ndjson") => has_jsonl = true,
+        let entry_path = entry.path();
+        if !entry_path.is_file() {
+            continue;
+        }
+        // Skip metadata/hidden files (e.g. _metadata, _SUCCESS, _dataset.json, .DS_Store)
+        if entry_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('_') || n.starts_with('.'))
+        {
+            continue;
+        }
+        match sniff_format(&entry_path) {
+            Ok(Some(Format::Parquet)) => parquet_files.push(entry_path),
+            Ok(Some(Format::Jsonl)) => jsonl_files.push(entry_path),
             _ => {}
         }
     }
 
-    match (has_parquet, has_jsonl) {
-        (true, false) => Ok(Format::Parquet),
-        (false, true) => Ok(Format::Jsonl),
+    match (!parquet_files.is_empty(), !jsonl_files.is_empty()) {
+        (true, false) => {
+            parquet_files.sort();
+            Ok((Format::Parquet, parquet_files))
+        }
+        (false, true) => {
+            jsonl_files.sort();
+            Ok((Format::Jsonl, jsonl_files))
+        }
         (true, true) => anyhow::bail!(
             "Directory {:?} contains mixed formats (parquet and jsonl)",
             path
         ),
         _ => anyhow::bail!(
-            "No supported files in {:?} (supported: .parquet, .jsonl, .ndjson)",
+            "No supported files in {:?} (content not recognized as Parquet or JSONL)",
             path
         ),
     }
 }
 
-fn format_from_extension(path: &Path) -> Result<Format> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("parquet") => Ok(Format::Parquet),
-        Some("jsonl" | "ndjson") => Ok(Format::Jsonl),
-        Some(ext) => anyhow::bail!("Unsupported file format: .{ext}"),
-        None => anyhow::bail!("Cannot determine format of {:?} (no extension)", path),
-    }
-}
-
-/// Detect format from path and open the appropriate source.
+/// Sniff format from content and open the appropriate source.
 pub fn open(path: &Path) -> Result<Box<dyn DataSource>> {
-    match detect_format(path)? {
-        Format::Parquet => {
-            let source = parquet::ParquetSource::open(path)?;
-            Ok(Box::new(source))
-        }
-        Format::Jsonl => {
-            let source = jsonl::JsonlSource::open(path)?;
-            Ok(Box::new(source))
-        }
+    let (format, files) = classify_path(path)?;
+    match format {
+        Format::Parquet => Ok(Box::new(parquet::ParquetSource::open_files(files)?)),
+        Format::Jsonl => Ok(Box::new(jsonl::JsonlSource::open_files(files)?)),
     }
 }
 

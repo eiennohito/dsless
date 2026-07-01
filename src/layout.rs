@@ -70,6 +70,12 @@ pub struct RenderSpecNode {
     pub kind: RenderSpecKind,
 }
 
+pub struct StructChild {
+    pub name: String,
+    pub schema_idx: usize,
+    pub spec: RenderSpecNode,
+}
+
 pub enum RenderSpecKind {
     Scalar,
     Float {
@@ -80,14 +86,9 @@ pub enum RenderSpecKind {
         max_display: usize,
     },
     Struct {
-        children: Vec<(String, RenderSpecNode)>,
+        children: Vec<StructChild>,
         table_mode: bool,
         col_widths: Vec<usize>,
-        /// Mapping from display position to schema column index.
-        /// `col_order[display_idx] = schema_idx`. Identity if no reorder.
-        col_order: Vec<usize>,
-        /// Fixed prefix for each data row (guides + left padding).
-        /// Empty for top-level structs.
         row_prefix: String,
     },
     List {
@@ -694,20 +695,20 @@ fn resolve_struct(
 ) -> RenderSpecNode {
     if !prefer_table || children.is_empty() {
         let child_ctx = ctx.deeper();
-        let resolved_children: Vec<(String, RenderSpecNode)> = children
+        let resolved_children: Vec<StructChild> = children
             .iter()
-            .map(|(name, node)| {
-                let child = resolve_node(node, &child_ctx);
-                (name.clone(), child)
+            .enumerate()
+            .map(|(i, (name, node))| StructChild {
+                name: name.clone(),
+                schema_idx: i,
+                spec: resolve_node(node, &child_ctx),
             })
             .collect();
-        let col_order: Vec<usize> = (0..children.len()).collect();
         return RenderSpecNode {
             kind: RenderSpecKind::Struct {
                 children: resolved_children,
                 table_mode: false,
                 col_widths: vec![],
-                col_order,
                 row_prefix: build_row_prefix(ctx.depth + 1, false),
             },
         };
@@ -803,12 +804,15 @@ fn resolve_struct(
 
     // Build children in display order
     let child_ctx = ctx.deeper();
-    let resolved_children: Vec<(String, RenderSpecNode)> = display_order
+    let resolved_children: Vec<StructChild> = display_order
         .iter()
         .map(|&i| {
             let (name, node) = &children[i];
-            let child = resolve_node(node, &child_ctx);
-            (name.clone(), child)
+            StructChild {
+                name: name.clone(),
+                schema_idx: i,
+                spec: resolve_node(node, &child_ctx),
+            }
         })
         .collect();
 
@@ -817,7 +821,6 @@ fn resolve_struct(
             children: resolved_children,
             table_mode: true,
             col_widths,
-            col_order: display_order,
             row_prefix: prefix,
         },
     }
@@ -926,9 +929,9 @@ fn collect_tables(node: &RenderSpecNode, path: &mut Vec<usize>, out: &mut Vec<Ta
             table_mode: false,
             ..
         } => {
-            for (i, (_, child)) in children.iter().enumerate() {
+            for (i, child) in children.iter().enumerate() {
                 path.push(i);
-                collect_tables(child, path, out);
+                collect_tables(&child.spec, path, out);
                 path.pop();
             }
         }
@@ -968,7 +971,7 @@ fn navigate_mut<'a>(root: &'a mut RenderSpecNode, path: &[usize]) -> &'a mut Ren
                 let RenderSpecKind::Struct { children, .. } = &mut node.kind else {
                     unreachable!()
                 };
-                node = &mut children[idx].1;
+                node = &mut children[idx].spec;
                 i += 1;
             }
             Step::Transparent => {
@@ -1705,7 +1708,7 @@ mod tests {
         let spec = RenderSpec::resolve(&layout, 40);
 
         match &spec.root.kind {
-            RenderSpecKind::Struct { children, .. } => match &children[0].1.kind {
+            RenderSpecKind::Struct { children, .. } => match &children[0].spec.kind {
                 RenderSpecKind::List { element } => match &element.kind {
                     RenderSpecKind::Scalar => {}
                     _ => panic!("list element should be Scalar"),

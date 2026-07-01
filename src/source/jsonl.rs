@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -34,10 +34,14 @@ pub struct JsonlSource {
 }
 
 impl JsonlSource {
-    pub fn open(path: &Path) -> Result<Self> {
-        let file_paths = collect_jsonl_files(path)?;
+    #[cfg(test)]
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        Self::open_files(vec![path.to_path_buf()])
+    }
+
+    pub fn open_files(file_paths: Vec<PathBuf>) -> Result<Self> {
         if file_paths.is_empty() {
-            anyhow::bail!("No JSONL files found at {:?}", path);
+            anyhow::bail!("No JSONL files provided");
         }
 
         let mut files = Vec::new();
@@ -193,29 +197,11 @@ impl DataSource for JsonlSource {
     }
 }
 
-fn collect_jsonl_files(path: &Path) -> Result<Vec<PathBuf>> {
-    if path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
-    }
-    if path.is_dir() {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
-            .with_context(|| format!("Failed to read directory {:?}", path))?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .is_some_and(|ext| ext == "jsonl" || ext == "ndjson")
-            })
-            .collect();
-        files.sort();
-        return Ok(files);
-    }
-    anyhow::bail!("{:?} is not a file or directory", path);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::DataType;
     use std::io::Write;
@@ -277,23 +263,23 @@ mod tests {
     }
 
     #[test]
-    fn open_directory_combines_files() {
+    fn open_files_combines_multiple() {
         let dir = tempfile::tempdir().unwrap();
-        write_jsonl(dir.path(), "a.jsonl", &[r#"{"v":1}"#, r#"{"v":2}"#]);
-        write_jsonl(dir.path(), "b.jsonl", &[r#"{"v":3}"#]);
+        let a = write_jsonl(dir.path(), "a.jsonl", &[r#"{"v":1}"#, r#"{"v":2}"#]);
+        let b = write_jsonl(dir.path(), "b.jsonl", &[r#"{"v":3}"#]);
 
-        let source = JsonlSource::open(dir.path()).unwrap();
+        let source = JsonlSource::open_files(vec![a, b]).unwrap();
         assert_eq!(source.total_rows(), 3);
         assert_eq!(source.file_count(), 2);
     }
 
     #[test]
-    fn directory_reads_across_file_boundary() {
+    fn reads_across_file_boundary() {
         let dir = tempfile::tempdir().unwrap();
-        write_jsonl(dir.path(), "a.jsonl", &[r#"{"v":10}"#]);
-        write_jsonl(dir.path(), "b.jsonl", &[r#"{"v":20}"#]);
+        let a = write_jsonl(dir.path(), "a.jsonl", &[r#"{"v":10}"#]);
+        let b = write_jsonl(dir.path(), "b.jsonl", &[r#"{"v":20}"#]);
 
-        let mut source = JsonlSource::open(dir.path()).unwrap();
+        let mut source = JsonlSource::open_files(vec![a, b]).unwrap();
 
         source.ensure_loaded(0).unwrap();
         let (batch, local) = source.get_row(0);
@@ -363,9 +349,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_directory_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = JsonlSource::open(dir.path());
+    fn empty_file_list_errors() {
+        let result = JsonlSource::open_files(vec![]);
         assert!(result.is_err());
     }
 

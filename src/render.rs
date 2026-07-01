@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::DataType;
 
-use crate::layout::{RenderSpec, RenderSpecKind, RenderSpecNode};
+use crate::layout::{RenderSpec, RenderSpecKind, RenderSpecNode, StructChild};
 use crate::unicode::{display_width, truncate_to_width};
 
 pub fn render_record(
@@ -47,7 +47,7 @@ impl RenderSpec {
                 header.push_str(" │ ");
                 separator.push_str("─┼─");
             }
-            let name = &children[ci].0;
+            let name = &children[ci].name;
             let w = display_width(name);
             if w > cw {
                 let truncated = truncate_to_width(name, cw);
@@ -77,7 +77,6 @@ impl RenderSpecNode {
             RenderSpecKind::Struct {
                 table_mode: true,
                 col_widths,
-                col_order,
                 children,
                 ..
             } => {
@@ -85,27 +84,23 @@ impl RenderSpecNode {
                     if di > 0 {
                         w.buf.push_str(" │ ");
                     }
-                    let schema_idx = col_order[di];
-                    let col = batch.column(schema_idx);
-                    children[di]
-                        .1
-                        .measure_cell(col.as_ref(), row, &mut w.scratch);
+                    let child = &children[di];
+                    let col = batch.column(child.schema_idx);
+                    child.spec.measure_cell(col.as_ref(), row, &mut w.scratch);
                     w.write_cell_padded(cw);
                 }
                 w.newline();
             }
             RenderSpecKind::Struct {
                 table_mode: false,
-                col_order,
                 children,
                 ..
             } => {
-                for (di, (name, child_spec)) in children.iter().enumerate() {
-                    let schema_idx = col_order[di];
-                    let col = batch.column(schema_idx);
+                for child in children {
+                    let col = batch.column(child.schema_idx);
                     w.guide(depth);
-                    let _ = write!(w, "{}: ", name);
-                    child_spec.render_value(col.as_ref(), row, w, depth);
+                    let _ = write!(w, "{}: ", child.name);
+                    child.spec.render_value(col.as_ref(), row, w, depth);
                 }
             }
             _ => unreachable!("root spec must be Struct"),
@@ -141,11 +136,11 @@ impl RenderSpecNode {
             RenderSpecKind::Struct { children, .. } => {
                 let sa = array.as_any().downcast_ref::<StructArray>().unwrap();
                 w.newline();
-                for (ci, (name, child_spec)) in children.iter().enumerate() {
-                    let child = sa.column(ci);
+                for child in children {
+                    let col = sa.column(child.schema_idx);
                     w.guide(depth + 1);
-                    let _ = write!(w, "{}: ", name);
-                    child_spec.render_value(child.as_ref(), row, w, depth + 1);
+                    let _ = write!(w, "{}: ", child.name);
+                    child.spec.render_value(col.as_ref(), row, w, depth + 1);
                 }
             }
             RenderSpecKind::List { element } => {
@@ -160,22 +155,12 @@ impl RenderSpecNode {
                     table_mode: true,
                     children: child_specs,
                     col_widths,
-                    col_order,
                     row_prefix,
                     ..
                 } = &element.kind
                 {
                     let sa = values.as_any().downcast_ref::<StructArray>().unwrap();
-                    render_nested_table(
-                        sa,
-                        start,
-                        end,
-                        child_specs,
-                        col_widths,
-                        col_order,
-                        row_prefix,
-                        w,
-                    );
+                    render_nested_table(sa, start, end, child_specs, col_widths, row_prefix, w);
                     return;
                 }
                 // Scalar list: inline
@@ -260,12 +245,14 @@ impl RenderSpecNode {
                 let total = children.len();
                 let preview_count = total.min(3);
                 out.push('{');
-                for (i, (name, child_spec)) in children.iter().enumerate().take(preview_count) {
+                for (i, child) in children.iter().enumerate().take(preview_count) {
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    let _ = write!(out, "{}: ", name);
-                    child_spec.write_cell_preview(out, sa.column(i).as_ref(), row);
+                    let _ = write!(out, "{}: ", child.name);
+                    child
+                        .spec
+                        .write_cell_preview(out, sa.column(child.schema_idx).as_ref(), row);
                     if out.len() > CELL_PREVIEW_BUDGET {
                         break;
                     }
@@ -352,14 +339,12 @@ impl RenderSpecNode {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_nested_table(
     sa: &StructArray,
     start: usize,
     end: usize,
-    child_specs: &[(String, RenderSpecNode)],
+    children: &[StructChild],
     col_widths: &[usize],
-    col_order: &[usize],
     row_prefix: &str,
     w: &mut LineWriter,
 ) {
@@ -379,7 +364,7 @@ fn render_nested_table(
         if di > 0 {
             w.buf.push_str(" │ ");
         }
-        w.write_padded(&child_specs[di].0, cw);
+        w.write_padded(&children[di].name, cw);
     }
     w.newline();
 
@@ -402,11 +387,9 @@ fn render_nested_table(
             if di > 0 {
                 w.buf.push_str(" │ ");
             }
-            let schema_idx = col_order[di];
-            let col = sa.column(schema_idx);
-            child_specs[di]
-                .1
-                .measure_cell(col.as_ref(), row, &mut w.scratch);
+            let child = &children[di];
+            let col = sa.column(child.schema_idx);
+            child.spec.measure_cell(col.as_ref(), row, &mut w.scratch);
             w.write_cell_padded(cw);
         }
         w.newline();

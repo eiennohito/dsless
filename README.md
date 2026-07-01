@@ -111,7 +111,9 @@ Status bar shows: `/{query}: {N} records, {M} in record`
 
 ## Supported formats
 
-- **Parquet** (`.parquet`) — including zstd/snappy/gzip compression, partitioned directories
-- **JSONL/NDJSON** (`.jsonl`, `.ndjson`) — newline-delimited JSON
+Format is detected from file content (magic bytes / leading JSON token), not extension.
+
+- **Parquet** — `PAR1` header magic; including zstd/snappy/gzip compression, partitioned directories
+- **JSONL/NDJSON** — first non-whitespace byte is `{` or `[`; newline-delimited JSON
 
 Planned: ORC, CSV.

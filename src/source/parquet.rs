@@ -1,5 +1,5 @@
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -30,10 +30,9 @@ pub struct ParquetSource {
 }
 
 impl ParquetSource {
-    pub fn open(path: &Path) -> Result<Self> {
-        let file_paths = collect_parquet_files(path)?;
+    pub fn open_files(file_paths: Vec<PathBuf>) -> Result<Self> {
         if file_paths.is_empty() {
-            anyhow::bail!("No parquet files found at {:?}", path);
+            anyhow::bail!("No parquet files provided");
         }
 
         let mut files = Vec::new();
@@ -138,19 +137,3 @@ impl DataSource for ParquetSource {
     }
 }
 
-fn collect_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
-    if path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
-    }
-    if path.is_dir() {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
-            .with_context(|| format!("Failed to read directory {:?}", path))?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
-            .collect();
-        files.sort();
-        return Ok(files);
-    }
-    anyhow::bail!("{:?} is not a file or directory", path);
-}

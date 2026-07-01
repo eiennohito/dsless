@@ -112,12 +112,22 @@ fn ndjson_extension_accepted() {
 }
 
 #[test]
-fn unsupported_extension_errors() {
+fn arbitrary_extension_detected_by_content() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_jsonl(dir.path(), "data.txt", &[r#"{"x":1}"#]);
 
+    let (out, ok) = run(&[path.to_str().unwrap()]);
+    assert!(ok, "should detect JSONL from content regardless of extension");
+    assert!(out.contains("Total: 1 row"), "missing row count in:\n{out}");
+}
+
+#[test]
+fn unrecognized_content_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_jsonl(dir.path(), "data.txt", &["hello world"]);
+
     let (_, ok) = run(&[path.to_str().unwrap()]);
-    assert!(!ok, "should fail on .txt extension");
+    assert!(!ok, "should fail on unrecognized content");
 }
 
 #[test]
