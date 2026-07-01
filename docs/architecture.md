@@ -10,7 +10,9 @@ src/
   source/              DataSource trait + format implementations
   cache.rs             SizedLruCache, RowCache
   worker.rs            Background thread: rendering + search
-  tui.rs               Terminal UI: draw loop, input, scroll
+  input.rs             Modal key handling: Mode, Action, InputHandler
+  tui/                 Terminal UI: event loop, cursor, line styling
+  viewport.rs          ViewportAnchor, NavIntent: scroll/jump math
   unicode.rs           Display-width helpers (CJK-aware)
 ```
 
@@ -19,7 +21,7 @@ src/
 ```
                     ┌─────────────┐
                     │  UI Thread  │
-                    │  (tui.rs)   │
+                    │   (tui/)    │
                     └──────┬──────┘
                            │ WorkerRequest / WorkerResponse
                     ┌──────┴──────┐
@@ -118,5 +120,15 @@ Two-level, async:
 2. **Within-record** (UI thread): when navigating to a matched record, scans the cached `RenderedRow` lines for the query string. Highlights matching lines.
 
 `n` skips all matches visible on the current screen and jumps to the next off-screen match. If more matches are needed and the scan isn't exhausted, requests another batch from the worker.
+
+## Cursor vs. viewport
+
+`ViewportAnchor` (in `viewport.rs`) tracks what's scrolled into view; `CursorState` (in `tui/cursor.rs`) tracks what's focused — the record a future preview action would act on, and in table mode, which column. They're deliberately separate types:
+
+- Plain scrolling (`j`/`k`/`J`/`K`/half-page) moves only the anchor. The cursor does not follow — this matches `less`/`vim` where scrolling and the cursor are independent.
+- Cursor movement (`Ctrl+j`/`Ctrl+k` for records, `h`/`l` for columns) moves only the cursor, dragging the anchor by the minimum amount needed to keep the cursor visible (`keep_record_visible`) — never re-centering the screen.
+- Actions that jump the anchor to a specific record (`g`/`G` with a count, `%`, search jumps) sync the cursor to match, since after a jump "where the viewport is" and "what's focused" should agree.
+
+This split exists because Phase 3 (preview) always previews `cursor.current_record`/`cursor.selected_col`, regardless of where the viewport happens to be scrolled.
 
 Navigation positions the first matching line at 20% from the top of the viewport.

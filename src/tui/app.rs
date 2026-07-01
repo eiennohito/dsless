@@ -5,15 +5,16 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{self, Event};
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::cache::RowCache;
 use crate::input::{Action, InputHandler, Mode};
 use crate::layout::{Layout, RenderSpec};
 use crate::search::SearchState;
 use crate::source::DataSource;
+use crate::tui::cursor::{CursorState, keep_record_visible};
+use crate::tui::help::render_help_popup;
+use crate::tui::style::{style_header_line, style_line};
 use crate::viewport::{NavContext, NavIntent, ViewportAnchor};
 use crate::worker::{WorkerRequest, WorkerResponse, worker_thread};
 
@@ -139,6 +140,7 @@ fn run_app(
 
     let mut anchor = ViewportAnchor::top();
     let mut input = InputHandler::new();
+    let mut cursor = CursorState::new(anchor.row());
 
     let mut search: Option<SearchState> = None;
     let mut searching = false; // worker is currently scanning
@@ -177,6 +179,7 @@ fn run_app(
                                 visible_height,
                             };
                             anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
+                            cursor.current_record = row;
                             worker_tx.send(render_range_for(
                                 row,
                                 visible_height,
@@ -203,14 +206,20 @@ fn run_app(
             let mut lines_remaining = visible_height;
 
             if is_table || anchor.is_at_top() {
-                for hline in &schema_header {
+                for (hi, hline) in schema_header.iter().enumerate() {
                     if lines_remaining == 0 {
                         break;
                     }
-                    display.push(Line::from(Span::styled(
-                        hline.to_string(),
-                        Style::default().fg(Color::Green),
-                    )));
+                    let is_header_row = is_table && hi == 0;
+                    let line = if is_header_row {
+                        style_header_line(hline, cursor.selected_col)
+                    } else {
+                        Line::from(Span::styled(
+                            hline.to_string(),
+                            Style::default().fg(Color::Green),
+                        ))
+                    };
+                    display.push(line);
                     lines_remaining -= 1;
                 }
             }
@@ -229,7 +238,9 @@ fn run_app(
                             break;
                         }
                         let line = rendered.line(li);
-                        let styled = style_line(line, row, &search);
+                        let is_current = row == cursor.current_record;
+                        let selected_col = if is_table { cursor.selected_col } else { None };
+                        let styled = style_line(line, row, &search, is_current, selected_col);
                         display.push(styled);
                         lines_remaining -= 1;
                     }
@@ -260,7 +271,7 @@ fn run_app(
                 let pct = if total_rows == 0 {
                     100
                 } else {
-                    (anchor.row() + 1) * 100 / total_rows
+                    (cursor.current_record + 1) * 100 / total_rows
                 };
                 let count_str = input.pending_count().map_or(String::new(), |n| format!("{}", n));
                 let search_info = if let Some(ref s) = search {
@@ -274,12 +285,17 @@ fn run_app(
                 } else {
                     String::new()
                 };
+                let cursor_info = match cursor.selected_col.and_then(|c| spec.column_name(c)) {
+                    Some(name) => format!(" | [col: {}]", name),
+                    None => String::new(),
+                };
                 format!(
-                    "{}Row {}/{} ({}){}",
+                    "{}Row {}/{} ({}){}{}",
                     count_str,
-                    anchor.row() + 1,
+                    cursor.current_record + 1,
                     total_rows,
                     pct,
+                    cursor_info,
                     search_info,
                 )
             };
@@ -374,12 +390,15 @@ fn run_app(
                     // --- Record navigation ---
                     Action::PrevRecord => {
                         anchor.apply(NavIntent::PrevRecordBoundary, &ctx);
+                        cursor.current_record = anchor.row();
                     }
                     Action::NextRecord => {
                         anchor.apply(NavIntent::NextRecordBoundary, &ctx);
+                        cursor.current_record = anchor.row();
                     }
                     Action::JumpToRecord(target) => {
                         anchor.apply(NavIntent::JumpToRecord(target), &ctx);
+                        cursor.current_record = anchor.row();
                     }
                     Action::JumpPercent(n) => {
                         let pct = n.min(100);
@@ -389,7 +408,34 @@ fn run_app(
                             (total_rows.saturating_sub(1) * pct) / 100
                         };
                         anchor.apply(NavIntent::JumpToRecord(target), &ctx);
+                        cursor.current_record = anchor.row();
                     }
+
+                    // --- Cell cursor ---
+                    Action::CursorRecordNext => {
+                        if cursor.current_record + 1 < total_rows {
+                            cursor.current_record += 1;
+                            keep_record_visible(
+                                &mut anchor,
+                                cursor.current_record,
+                                last_visible_row,
+                                &ctx,
+                            );
+                        }
+                    }
+                    Action::CursorRecordPrev => {
+                        if cursor.current_record > 0 {
+                            cursor.current_record -= 1;
+                            keep_record_visible(
+                                &mut anchor,
+                                cursor.current_record,
+                                last_visible_row,
+                                &ctx,
+                            );
+                        }
+                    }
+                    Action::CellLeft => cursor.move_left(),
+                    Action::CellRight => cursor.move_right(spec.column_count()),
 
                     // --- Search ---
                     Action::EnterSearch | Action::SearchQueryChanged => {}
@@ -416,6 +462,7 @@ fn run_app(
                                 let match_line =
                                     s.record_line_matches.first().copied().unwrap_or(0);
                                 anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
+                                cursor.current_record = row;
                                 worker_tx.send(render_range_for(
                                     row,
                                     visible_height,
@@ -442,6 +489,7 @@ fn run_app(
                                 let match_line =
                                     s.record_line_matches.first().copied().unwrap_or(0);
                                 anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
+                                cursor.current_record = row;
                                 worker_tx.send(render_range_for(
                                     row,
                                     visible_height,
@@ -460,12 +508,8 @@ fn run_app(
 
                     Action::ShowHelp | Action::DismissHelp => {}
 
-                    // --- Cell cursor / preview: Phase 2/3 will consume these ---
-                    Action::CellLeft
-                    | Action::CellRight
-                    | Action::CursorRecordNext
-                    | Action::CursorRecordPrev
-                    | Action::ShowFieldNumbers
+                    // --- Preview: Phase 3 will consume these ---
+                    Action::ShowFieldNumbers
                     | Action::PreviewField(_)
                     | Action::RepeatPreview
                     | Action::PreviewCursorCell
@@ -485,107 +529,4 @@ fn run_app(
     }
 
     Ok(())
-}
-
-// ============================================================
-// Help popup
-// ============================================================
-
-fn render_help_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-    let help_text = vec![
-        Line::from(Span::styled(
-            " dsless ",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            " Scrolling",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  j / Down      line down"),
-        Line::from("  k / Up        line up"),
-        Line::from("  J / PageDown  page down"),
-        Line::from("  K / PageUp    page up"),
-        Line::from("  Space/Ctrl-d  half page down"),
-        Line::from("  Ctrl-u        half page up"),
-        Line::from(""),
-        Line::from(Span::styled(
-            " Records",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  g             start of record / prev record"),
-        Line::from("  G             next record"),
-        Line::from("  <N>g / <N>G   go to record N"),
-        Line::from("  <N>%          go to N% of dataset"),
-        Line::from(""),
-        Line::from(Span::styled(
-            " Search",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  /             search"),
-        Line::from("  n             next match (off-screen)"),
-        Line::from("  N             previous match"),
-        Line::from("  Esc           clear search"),
-        Line::from(""),
-        Line::from(Span::styled(
-            " Other",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  q / Ctrl-c    quit"),
-        Line::from("  ?             this help"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "       press any key to close",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-
-    let height = help_text.len() as u16 + 2; // +2 for borders
-    let width = 42;
-    let x = area.width.saturating_sub(width) / 2;
-    let y = area.height.saturating_sub(height) / 2;
-    let popup_area =
-        ratatui::layout::Rect::new(x, y, width.min(area.width), height.min(area.height));
-
-    frame.render_widget(Clear, popup_area);
-    let popup = Paragraph::new(help_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-    frame.render_widget(popup, popup_area);
-}
-
-// ============================================================
-// Line styling
-// ============================================================
-
-fn style_line<'a>(line: &str, row: usize, search: &Option<SearchState>) -> Line<'a> {
-    let is_match_row = search
-        .as_ref()
-        .is_some_and(|s| s.matched_set.contains(&row));
-
-    if line.starts_with("── Row") {
-        let style = if is_match_row {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        };
-        Line::from(Span::styled(line.to_string(), style))
-    } else if is_match_row
-        && search
-            .as_ref()
-            .is_some_and(|s| line.to_lowercase().contains(&s.query_lower))
-    {
-        Line::from(Span::styled(
-            line.to_string(),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        ))
-    } else {
-        Line::from(line.to_string())
-    }
 }
