@@ -7,6 +7,7 @@ src/
   main.rs              CLI parsing, pipe mode output
   layout/              Two-layer display model: Layout + RenderSpec
   render.rs            Rendering methods on RenderSpec types
+  preview.rs           SchemaPath, truncation detection, full-field render
   source/              DataSource trait + format implementations
   cache.rs             SizedLruCache, RowCache
   worker.rs            Background thread: rendering + search
@@ -123,12 +124,26 @@ Two-level, async:
 
 ## Cursor vs. viewport
 
-`ViewportAnchor` (in `viewport.rs`) tracks what's scrolled into view; `CursorState` (in `tui/cursor.rs`) tracks what's focused — the record a future preview action would act on, and in table mode, which column. They're deliberately separate types:
+`ViewportAnchor` (in `viewport.rs`) tracks what's scrolled into view; `CursorState` (in `tui/cursor.rs`) tracks what's focused — the record a preview action acts on, and in table mode, which column. They're deliberately separate types:
 
 - Plain scrolling (`j`/`k`/`J`/`K`/half-page) moves only the anchor. The cursor does not follow — this matches `less`/`vim` where scrolling and the cursor are independent.
 - Cursor movement (`Ctrl+j`/`Ctrl+k` for records, `h`/`l` for columns) moves only the cursor, dragging the anchor by the minimum amount needed to keep the cursor visible (`keep_record_visible`) — never re-centering the screen.
 - Actions that jump the anchor to a specific record (`g`/`G` with a count, `%`, search jumps) sync the cursor to match, since after a jump "where the viewport is" and "what's focused" should agree.
 
-This split exists because Phase 3 (preview) always previews `cursor.current_record`/`cursor.selected_col`, regardless of where the viewport happens to be scrolled.
+This split exists because preview always previews `cursor.current_record`/`cursor.selected_col`, regardless of where the viewport happens to be scrolled.
 
 Navigation positions the first matching line at 20% from the top of the viewport.
+
+## Preview
+
+The UI thread never touches Arrow data, so truncation detection and full-value rendering both happen worker-side and cross the channel as request/response pairs (`ListTruncatedFields`/`TruncatedFields`, `RenderFullField`/`FieldRendered` in `worker.rs`).
+
+`SchemaPath` (`preview.rs`) addresses a field in the schema tree: a single index in table mode (the column), or a chain of `schema_idx` values through nested structs in vertical mode. Lists and maps are not addressable by path — previewing one expands the whole field rather than a specific element, since a path describes schema shape, not a position within row data.
+
+`RenderSpec::find_truncated_fields` walks the row using the already-rendered widths (`write_cell_preview` vs `col_widths` in table mode; `max_display` vs actual string width in vertical mode, recursing into nested structs) to list which fields are currently cut off — these become the numbered targets for the `v` overlay.
+
+`render_field_full` renders one field with no width limits. Because a preview must be untruncated at every depth (not just the target field), it first rebuilds the field's spec subtree with every string's `max_display` set to unlimited (`unlimit`), then renders through the normal recursive `render_value`. A struct-typed field is rendered by writing its children directly rather than going through the nested-struct branch of `render_value`, which opens with a blank line intended for when a `"field: "` prefix already precedes it — there is no such prefix at the top of a standalone preview.
+
+Display size decides inline vs. popup: `<=3` lines renders inline (appended after the row, styled distinctly); more than that opens a scrollable popup and force-transitions `InputHandler` into `Mode::Preview` via `set_mode`, since `V`/Space fire from `Mode::Normal` and the popup's j/k scrolling only exists in Preview mode.
+
+Every worker response carries the `row`/`path` it answers, so the UI can drop stale responses if the user has since dismissed the preview or moved to a different record before the worker replies.

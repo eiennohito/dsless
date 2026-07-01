@@ -110,7 +110,7 @@ impl RenderSpecNode {
     /// Expand a value across multiple lines with tree guides.
     /// Each spec kind knows its own format: floats use precision,
     /// strings use max_display, structs recurse into children.
-    fn render_value(&self, array: &dyn Array, row: usize, w: &mut LineWriter, depth: usize) {
+    pub(crate) fn render_value(&self, array: &dyn Array, row: usize, w: &mut LineWriter, depth: usize) {
         if array.is_null(row) {
             let _ = write!(w, "null");
             w.newline();

@@ -10,10 +10,16 @@ use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientatio
 use crate::cache::RowCache;
 use crate::input::{Action, InputHandler, Mode};
 use crate::layout::{Layout, RenderSpec};
+use crate::preview::SchemaPath;
 use crate::search::SearchState;
 use crate::source::DataSource;
 use crate::tui::cursor::{CursorState, keep_record_visible};
 use crate::tui::help::render_help_popup;
+use crate::tui::preview::{
+    ActivePreview, FieldOverlay, PreviewState, annotate_vertical_line,
+    is_current_row_with_inline_preview, overlay_header_line, render_inline_lines,
+    render_preview_popup,
+};
 use crate::tui::style::{style_header_line, style_line};
 use crate::viewport::{NavContext, NavIntent, ViewportAnchor};
 use crate::worker::{WorkerRequest, WorkerResponse, worker_thread};
@@ -146,6 +152,17 @@ fn run_app(
     let mut searching = false; // worker is currently scanning
     let mut search_progress: Option<usize> = None;
 
+    let mut preview = PreviewState::new();
+    // Tracks which in-flight worker request a response is allowed to apply to,
+    // so a response arriving after the user moved on (dismissed, jumped
+    // record, requested another field) is recognized as stale and dropped.
+    let mut pending_truncation_row: Option<usize> = None;
+    let mut pending_field: Option<(usize, SchemaPath)> = None;
+    // `<N>v` typed directly in Normal mode (no VOverlay shown first) needs
+    // the truncated-field list before it can resolve N to a path; this
+    // records N so the ListTruncatedFields response can act on it.
+    let mut pending_field_selection: Option<usize> = None;
+
     // Tracks the last visible row from the most recent draw pass
     let mut last_visible_row: usize = 0;
     // Set during draw when a cache miss is detected
@@ -193,6 +210,42 @@ fn run_app(
                 WorkerResponse::SearchProgress(row) => {
                     search_progress = Some(row);
                 }
+                WorkerResponse::TruncatedFields { row, fields } => {
+                    if pending_truncation_row == Some(row) {
+                        pending_truncation_row = None;
+
+                        if let Some(n) = pending_field_selection.take() {
+                            // Direct `<N>v` from Normal mode: resolve N against
+                            // the list that just arrived instead of showing the overlay.
+                            if let Some(path) = fields.get(n.wrapping_sub(1)).map(|f| f.path.clone()) {
+                                pending_field = Some((row, path.clone()));
+                                worker_tx.send(WorkerRequest::RenderFullField { row, path })?;
+                            }
+                        } else if fields.is_empty() {
+                            preview.message = Some("no truncated fields".to_string());
+                            input.set_mode(Mode::Normal);
+                        } else {
+                            preview.overlay = Some(FieldOverlay { row, fields });
+                        }
+                    }
+                }
+                WorkerResponse::FieldRendered {
+                    row,
+                    path,
+                    name,
+                    content,
+                    line_count,
+                } => {
+                    if pending_field.as_ref() == Some(&(row, path.clone())) {
+                        pending_field = None;
+                        let active = ActivePreview::new(row, name, content, line_count);
+                        if active.is_popup {
+                            input.set_mode(Mode::Preview);
+                        }
+                        preview.active_preview = Some(active);
+                        preview.last_path = Some(path);
+                    }
+                }
             }
         }
 
@@ -221,6 +274,15 @@ fn run_app(
                     };
                     display.push(line);
                     lines_remaining -= 1;
+
+                    if is_header_row
+                        && lines_remaining > 0
+                        && let (Some(overlay), Some(col_widths)) =
+                            (&preview.overlay, spec.col_widths())
+                    {
+                        display.push(overlay_header_line(overlay, col_widths));
+                        lines_remaining -= 1;
+                    }
                 }
             }
 
@@ -233,6 +295,7 @@ fn run_app(
 
             while lines_remaining > 0 && row < total_rows {
                 if let Some(rendered) = cache.get(row) {
+                    let overlay_here = preview.overlay.as_ref().filter(|o| o.row == row && !is_table);
                     for li in skip..rendered.line_count() {
                         if lines_remaining == 0 {
                             break;
@@ -240,7 +303,16 @@ fn run_app(
                         let line = rendered.line(li);
                         let is_current = row == cursor.current_record;
                         let selected_col = if is_table { cursor.selected_col } else { None };
-                        let styled = style_line(line, row, &search, is_current, selected_col);
+                        let styled = match overlay_here {
+                            Some(overlay) => style_line(
+                                &annotate_vertical_line(line, overlay),
+                                row,
+                                &search,
+                                is_current,
+                                selected_col,
+                            ),
+                            None => style_line(line, row, &search, is_current, selected_col),
+                        };
                         display.push(styled);
                         lines_remaining -= 1;
                     }
@@ -252,6 +324,17 @@ fn run_app(
                     )));
                     lines_remaining -= 1;
                 }
+
+                if is_current_row_with_inline_preview(&preview, row) {
+                    for l in render_inline_lines(preview.active_preview.as_ref().unwrap()) {
+                        if lines_remaining == 0 {
+                            break;
+                        }
+                        display.push(l);
+                        lines_remaining -= 1;
+                    }
+                }
+
                 skip = 0;
                 row += 1;
             }
@@ -264,6 +347,8 @@ fn run_app(
             // Status bar
             let status = if input.mode() == Mode::Search {
                 format!("/{}  ", input.search_query())
+            } else if let Some(ref msg) = preview.message {
+                msg.clone()
             } else if searching {
                 let prog = search_progress.map_or(String::new(), |r| format!(" (at row {})", r));
                 format!("Searching...{}", prog)
@@ -313,6 +398,9 @@ fn run_app(
 
             if input.mode() == Mode::Help {
                 render_help_popup(frame, area);
+            }
+            if let Some(active) = preview.active_preview.as_ref().filter(|p| p.is_popup) {
+                render_preview_popup(frame, area, active);
             }
         })?;
 
@@ -504,16 +592,74 @@ fn run_app(
                         search = None;
                         searching = false;
                         search_progress = None;
+                        preview.dismiss();
+                        pending_truncation_row = None;
+                        pending_field = None;
+                        pending_field_selection = None;
                     }
 
                     Action::ShowHelp | Action::DismissHelp => {}
 
-                    // --- Preview: Phase 3 will consume these ---
-                    Action::ShowFieldNumbers
-                    | Action::PreviewField(_)
-                    | Action::RepeatPreview
-                    | Action::PreviewCursorCell
-                    | Action::PreviewScroll(_) => {}
+                    // --- Preview ---
+                    Action::ShowFieldNumbers => {
+                        preview.message = None;
+                        pending_truncation_row = Some(cursor.current_record);
+                        worker_tx.send(WorkerRequest::ListTruncatedFields {
+                            row: cursor.current_record,
+                        })?;
+                    }
+                    Action::PreviewField(n) => {
+                        match preview
+                            .overlay
+                            .as_ref()
+                            .filter(|o| o.row == cursor.current_record)
+                        {
+                            Some(overlay) => {
+                                if let Some(path) =
+                                    overlay.fields.get(n.wrapping_sub(1)).map(|f| f.path.clone())
+                                {
+                                    pending_field = Some((cursor.current_record, path.clone()));
+                                    worker_tx.send(WorkerRequest::RenderFullField {
+                                        row: cursor.current_record,
+                                        path,
+                                    })?;
+                                }
+                            }
+                            // `<N>v` typed directly in Normal mode: the field list
+                            // for this record hasn't been fetched yet.
+                            None => {
+                                pending_field_selection = Some(n);
+                                pending_truncation_row = Some(cursor.current_record);
+                                worker_tx.send(WorkerRequest::ListTruncatedFields {
+                                    row: cursor.current_record,
+                                })?;
+                            }
+                        }
+                    }
+                    Action::RepeatPreview => {
+                        if let Some(path) = preview.last_path.clone() {
+                            pending_field = Some((cursor.current_record, path.clone()));
+                            worker_tx.send(WorkerRequest::RenderFullField {
+                                row: cursor.current_record,
+                                path,
+                            })?;
+                        }
+                    }
+                    Action::PreviewCursorCell => {
+                        if let Some(col) = cursor.selected_col {
+                            let path = SchemaPath(vec![col]);
+                            pending_field = Some((cursor.current_record, path.clone()));
+                            worker_tx.send(WorkerRequest::RenderFullField {
+                                row: cursor.current_record,
+                                path,
+                            })?;
+                        }
+                    }
+                    Action::PreviewScroll(n) => {
+                        if let Some(ref mut active) = preview.active_preview {
+                            active.scroll(n);
+                        }
+                    }
                 }
 
                 worker_tx.send(render_range_for(

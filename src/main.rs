@@ -1,6 +1,7 @@
 mod cache;
 mod input;
 mod layout;
+mod preview;
 mod render;
 mod search;
 mod source;

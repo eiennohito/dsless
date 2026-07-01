@@ -2,6 +2,7 @@ use std::sync::{Arc, mpsc};
 
 use crate::cache::RowCache;
 use crate::layout::RenderSpec;
+use crate::preview::{self, SchemaPath, TruncatedField};
 use crate::render::{self, LineWriter};
 use crate::search;
 use crate::source::DataSource;
@@ -18,6 +19,15 @@ pub enum WorkerRequest {
         scan_from: usize,
         limit: usize,
     },
+    /// List truncated fields for the `v` overlay.
+    ListTruncatedFields {
+        row: usize,
+    },
+    /// Render one field's value with no width constraints, for the preview popup.
+    RenderFullField {
+        row: usize,
+        path: SchemaPath,
+    },
     /// Terminal resized — adopt a new RenderSpec.
     UpdateSpec(Arc<RenderSpec>),
     Shutdown,
@@ -32,6 +42,17 @@ pub enum WorkerResponse {
         scanned_up_to: usize,
     },
     SearchProgress(usize),
+    TruncatedFields {
+        row: usize,
+        fields: Vec<TruncatedField>,
+    },
+    FieldRendered {
+        row: usize,
+        path: SchemaPath,
+        name: String,
+        content: String,
+        line_count: usize,
+    },
 }
 
 pub fn worker_thread(
@@ -45,37 +66,29 @@ pub fn worker_thread(
 
     while let Ok(req) = rx.recv() {
         let req = drain_latest(req, &rx);
+        if matches!(req, WorkerRequest::Shutdown) {
+            break;
+        }
 
-        match req {
-            WorkerRequest::UpdateSpec(new_spec) => {
-                spec = new_spec;
-            }
-            WorkerRequest::RenderRange { start, end } => {
-                render_range(&mut source, &cache, &mut writer, &spec, start, end);
-
-                if let Ok(newer) = rx.try_recv() {
+        // RenderRange gets a special continuation: peek for one more request
+        // right after finishing, so a RowsReady isn't sent (and redrawn on)
+        // when there's already newer work queued.
+        if let WorkerRequest::RenderRange { start, end } = req {
+            render_range(&mut source, &cache, &mut writer, &spec, start, end);
+            match rx.try_recv() {
+                Ok(newer) => {
                     let newer = drain_latest(newer, &rx);
+                    if matches!(newer, WorkerRequest::Shutdown) {
+                        break;
+                    }
                     handle_request(newer, &mut source, &cache, &mut writer, &mut spec, &tx);
-                } else {
+                }
+                Err(_) => {
                     let _ = tx.send(WorkerResponse::RowsReady);
                 }
             }
-            WorkerRequest::FindMatchingRecords {
-                query,
-                scan_from,
-                limit,
-            } => {
-                do_search(
-                    &mut source,
-                    &spec,
-                    &query,
-                    scan_from,
-                    limit,
-                    &mut writer,
-                    &tx,
-                );
-            }
-            WorkerRequest::Shutdown => break,
+        } else {
+            handle_request(req, &mut source, &cache, &mut writer, &mut spec, &tx);
         }
     }
 }
@@ -148,6 +161,12 @@ fn handle_request(
         } => {
             do_search(source, spec, &query, scan_from, limit, writer, tx);
         }
+        WorkerRequest::ListTruncatedFields { row } => {
+            list_truncated_fields(source, spec, row, tx);
+        }
+        WorkerRequest::RenderFullField { row, path } => {
+            render_full_field(source, spec, writer, row, path, tx);
+        }
         WorkerRequest::UpdateSpec(new_spec) => {
             *spec = new_spec;
         }
@@ -155,13 +174,64 @@ fn handle_request(
     }
 }
 
+/// Truncation detection needs the raw Arrow row (not the cached rendered
+/// text), so it loads directly through the source rather than the cache.
+fn list_truncated_fields(
+    source: &mut Box<dyn DataSource>,
+    spec: &RenderSpec,
+    row: usize,
+    tx: &mpsc::Sender<WorkerResponse>,
+) {
+    if source.ensure_loaded(row).is_err() {
+        let _ = tx.send(WorkerResponse::TruncatedFields {
+            row,
+            fields: Vec::new(),
+        });
+        return;
+    }
+    let (batch, local_row) = source.get_row(row);
+    let fields = spec.find_truncated_fields(batch, local_row);
+    let _ = tx.send(WorkerResponse::TruncatedFields { row, fields });
+}
+
+fn render_full_field(
+    source: &mut Box<dyn DataSource>,
+    spec: &RenderSpec,
+    writer: &mut LineWriter,
+    row: usize,
+    path: SchemaPath,
+    tx: &mpsc::Sender<WorkerResponse>,
+) {
+    if source.ensure_loaded(row).is_err() {
+        return;
+    }
+    let (batch, local_row) = source.get_row(row);
+    if let Some((name, rendered)) = preview::render_field_full(spec, batch, local_row, &path, writer)
+    {
+        let content = rendered.lines().collect::<Vec<_>>().join("\n");
+        let line_count = rendered.line_count();
+        let _ = tx.send(WorkerResponse::FieldRendered {
+            row,
+            path,
+            name,
+            content,
+            line_count,
+        });
+    }
+}
+
+/// Coalesce consecutive `RenderRange` requests into the newest one — the UI
+/// sends these on every scroll tick, and only the latest range matters.
+/// Every other request type (search, preview, resize, shutdown) represents
+/// a discrete user action that must be handled, so draining stops as soon
+/// as one is seen instead of silently dropping it.
 fn drain_latest(initial: WorkerRequest, rx: &mpsc::Receiver<WorkerRequest>) -> WorkerRequest {
     let mut latest = initial;
-    while let Ok(newer) = rx.try_recv() {
-        if matches!(newer, WorkerRequest::Shutdown) {
-            return newer;
+    while matches!(latest, WorkerRequest::RenderRange { .. }) {
+        match rx.try_recv() {
+            Ok(newer) => latest = newer,
+            Err(_) => break,
         }
-        latest = newer;
     }
     latest
 }

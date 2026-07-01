@@ -98,6 +98,13 @@ impl InputHandler {
         self.has_active_search = v;
     }
 
+    /// Lets the app force a mode transition when an async event (not a key
+    /// press) changes what input should mean next — e.g. entering Preview
+    /// mode once `V`/Space's worker response arrives with content to show.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
     pub fn handle(&mut self, key: KeyEvent) -> Action {
         match self.mode {
             Mode::Help => {
@@ -615,5 +622,17 @@ mod tests {
         h.handle(ch('v'));
         assert_eq!(h.handle(ch('q')), Action::None);
         assert_eq!(h.mode(), Mode::Preview);
+    }
+
+    #[test]
+    fn set_mode_forces_transition_for_async_preview() {
+        // V/Space stay in Normal mode on keypress; the app enters Preview
+        // once the worker's async response actually has popup content.
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(ch('V')), Action::RepeatPreview);
+        assert_eq!(h.mode(), Mode::Normal);
+        h.set_mode(Mode::Preview);
+        assert_eq!(h.mode(), Mode::Preview);
+        assert_eq!(h.handle(ch('j')), Action::PreviewScroll(1));
     }
 }
