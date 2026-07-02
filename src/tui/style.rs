@@ -1,11 +1,7 @@
 use ratatui::prelude::*;
 
+use crate::render::COLUMN_SEPARATOR;
 use crate::search::SearchState;
-
-/// Separates table-mode columns in a rendered line; also used to locate
-/// column boundaries for cursor highlighting. Chosen because it never
-/// appears inside rendered cell content (see docs/architecture.md).
-const COLUMN_SEPARATOR: &str = " │ ";
 
 /// Background used to mark the row the cursor is currently focused on.
 const CURRENT_RECORD_BG: Color = Color::DarkGray;
@@ -44,6 +40,10 @@ pub fn style_line<'a>(
 
     if selected_col.is_some() && line.contains(COLUMN_SEPARATOR) {
         return style_table_row(line, is_current, selected_col);
+    }
+
+    if is_current && line.contains(COLUMN_SEPARATOR) {
+        return style_table_row(line, true, selected_col);
     }
 
     if is_match_row
@@ -132,8 +132,16 @@ mod tests {
     }
 
     #[test]
-    fn style_line_current_record_without_column_gets_background() {
-        let line = style_line("alice │ 42", 0, &None, true, None);
+    fn style_line_cursor_on_table_row_splits_even_without_col_selected() {
+        let line = style_line("alice   │ 42", 0, &None, true, None);
+        let texts = span_texts(&line);
+        assert_eq!(texts, vec!["alice  ", " │ ", "42"]);
+        assert_eq!(line.spans[0].style.bg, Some(CURRENT_RECORD_BG));
+    }
+
+    #[test]
+    fn style_line_cursor_on_plain_line_gets_background() {
+        let line = style_line("│ name: alice", 0, &None, true, None);
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].style.bg, Some(CURRENT_RECORD_BG));
     }

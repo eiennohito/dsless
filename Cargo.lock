@@ -780,6 +780,7 @@ dependencies = [
  "ratatui",
  "rustc-hash",
  "ryu",
+ "smallvec",
  "tempfile",
  "unicode-width",
 ]

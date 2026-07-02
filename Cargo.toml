@@ -15,6 +15,7 @@ unicode-width = "0.2"
 lru = "0.18"
 ryu = "1.0.23"
 rustc-hash = "2.1.2"
+smallvec = "1"
 
 [dev-dependencies]
 tempfile = "3"

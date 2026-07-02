@@ -1,28 +1,10 @@
 # dsless
 
-A terminal pager for data-science file formats. Think `less`, but for parquet files with deeply nested schemas.
-
-## TL;DR
+A terminal pager for parquet and JSONL. Think `less`, but it understands nested schemas.
 
 ```bash
-# Install binary
-curl -fsSL https://raw.githubusercontent.com/eiennohito/dsless/main/install.sh | sh
-
-dsless data.parquet          # TUI mode
-dsless parquet-dir/           # reads all .parquet files in directory
-dsless data.jsonl             # JSONL/NDJSON files
-dsless data.parquet | head    # pipe mode, plain text output
+dsless data.parquet
 ```
-
-Renders nested structs, arrays-of-structs-as-tables, and deeply nested lists in a readable tree layout with CJK-aware column alignment.
-
-## AI-Assisted coding disclaimer
-
-This project is written in fully AI-assisted manner. Most of the code is generated. If you do not like AI slop, you know what it is.
-
-## Why
-
-Existing tools (`parquet-tools`, `duckdb`, pandas) choke on complex nested schemas — arrays of structs with nested lists render as unreadable JSON blobs or get truncated. dsless renders them as indented trees with vertical guides and auto-tables:
 
 ```
 ── Row 0 ──
@@ -39,81 +21,42 @@ Existing tools (`parquet-tools`, `duckdb`, pandas) choke on complex nested schem
 │ │   "category" │ ["tools", "diy"]
 ```
 
-## Installation
+Nested structs render as indented trees. Arrays of structs become tables. Long strings and deep nesting stay readable.
 
-### Binary (recommended)
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eiennohito/dsless/main/install.sh | sh
 ```
 
-Installs to `~/.local/bin` by default. Override with `DSLESS_INSTALL_DIR`:
+macOS (universal), Linux x86_64, Linux aarch64. Installs to `~/.local/bin`.
 
-```bash
-DSLESS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/eiennohito/dsless/main/install.sh | sh
-```
-
-Supports macOS (universal), Linux x86_64, and Linux aarch64.
-
-### From source
-
-Requires Rust 1.85+.
-
-```bash
-git clone https://github.com/eiennohito/dsless.git
-cd dsless
-cargo install --path .
-```
+Or from source (Rust 1.85+): `cargo install --path .`
 
 ## Usage
 
 ```bash
-dsless <path>              # file or directory of parquet files
-dsless -n 50 <path>        # limit to 50 rows (pipe mode default: 1000)
-dsless <path> | less        # pipe mode: plain text, no TUI
+dsless file.parquet            # TUI mode
+dsless parquet-dir/            # reads all files in directory
+dsless file.jsonl              # JSONL/NDJSON
+dsless file.parquet | head     # pipe mode — plain text, no TUI
+dsless -n 50 file.parquet      # limit rows (pipe default: 1000)
 ```
 
-## Keybindings
+Format is detected from file content, not extension.
 
-### Scrolling
+## Keys
 
-| Key | Action |
-|---|---|
-| `j` / `↓` | Scroll 1 line down |
-| `k` / `↑` | Scroll 1 line up |
-| `K` / PageDown | Scroll 1 page down |
-| `J` / PageUp | Scroll 1 page up |
-| Space / Ctrl-d | Half page down |
-| Ctrl-u | Half page up |
+Vim-style. `j`/`k` scroll, `J`/`K` page, `g`/`G` jump between records, `q` quits.
 
-### Record navigation
+**Cursor**: `Ctrl-j`/`Ctrl-k` move between records, `h`/`l` select columns.
 
-| Key | Action |
-|---|---|
-| `g` | Go to start of current record; if already there, previous record |
-| `G` | Go to next record |
-| `<N>g` | Go to record N |
-| `<N>G` | Go to record N |
-| `<N>%` | Go to record at N% of dataset |
+**Search**: `/` to search, `n`/`N` for next/prev match. Searches across parquet columns directly, then highlights matching lines.
 
-### Search
+**Preview**: `v` shows an overlay of truncated fields — type the label to expand. `V` repeats last preview on a new record. `Space` previews the field under the cursor. `j`/`k` scroll inside a preview, `v`/`Space`/`Esc` dismiss.
 
-| Key | Action |
-|---|---|
-| `/` | Enter search query |
-| `n` | Next match (skips all on-screen matches) |
-| `N` | Previous match |
-| Esc | Clear search |
+`?` for the full keymap inside the TUI.
 
-Search is two-level: first finds matching records (scanning parquet columns directly), then highlights matching lines within the current record.
+## AI-assisted
 
-Status bar shows: `/{query}: {N} records, {M} in record`
-
-## Supported formats
-
-Format is detected from file content (magic bytes / leading JSON token), not extension.
-
-- **Parquet** — `PAR1` header magic; including zstd/snappy/gzip compression, partitioned directories
-- **JSONL/NDJSON** — first non-whitespace byte is `{` or `[`; newline-delimited JSON
-
-Planned: ORC, CSV.
+Most code is AI-generated. If that bothers you, now you know.

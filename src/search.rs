@@ -21,6 +21,10 @@ pub struct SearchState {
     pub scan_cursor: usize,
     pub current_idx: usize,
     pub record_line_matches: Vec<usize>,
+    /// True while a `FindMatchingRecords` request is in flight on the worker.
+    pub scanning: bool,
+    /// Row the worker last reported scanning through, for status-bar feedback.
+    pub progress: Option<usize>,
 }
 
 impl SearchState {
@@ -35,6 +39,8 @@ impl SearchState {
             scan_cursor: 0,
             current_idx: 0,
             record_line_matches: Vec::new(),
+            scanning: false,
+            progress: None,
         }
     }
 

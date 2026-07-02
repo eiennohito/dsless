@@ -1,5 +1,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+pub const LABEL_CHARS: &[u8] = b"1234567890wertyuio";
+
+fn is_label_char(c: char) -> bool {
+    c.is_ascii() && LABEL_CHARS.contains(&(c as u8))
+}
+
 // ============================================================
 // Mode — what the handler is currently interpreting keys as
 // ============================================================
@@ -42,15 +48,16 @@ pub enum Action {
     SearchPrev,
     DismissOverlay,
 
-    // Cell cursor (Phase 2 will consume these)
+    // Cell cursor
     CellLeft,
     CellRight,
     CursorRecordNext,
     CursorRecordPrev,
 
-    // Preview (Phase 2/3 — emitted now, tui.rs ignores them)
+    // Preview
     ShowFieldNumbers,
-    PreviewField(usize),
+    OverlayInput(char),
+    DismissPreview,
     RepeatPreview,
     PreviewCursorCell,
     PreviewScroll(isize),
@@ -143,36 +150,21 @@ impl InputHandler {
     }
 
     fn handle_voverlay(&mut self, key: KeyEvent) -> Action {
-        if let KeyCode::Char(c @ '1'..='9') = key.code {
-            let digit = c as usize - '0' as usize;
-            self.pending_count = Some(self.pending_count.unwrap_or(0) * 10 + digit);
-            return Action::None;
-        }
-        if key.code == KeyCode::Char('0') && self.pending_count.is_some() {
-            self.pending_count = Some(self.pending_count.unwrap() * 10);
-            return Action::None;
-        }
-
         match key.code {
-            KeyCode::Char('v') => {
-                let n = self.pending_count.take().unwrap_or(0);
-                self.mode = Mode::Preview;
-                Action::PreviewField(n)
-            }
-            KeyCode::Esc => {
-                self.pending_count = None;
+            KeyCode::Char('v') | KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 Action::DismissOverlay
             }
-            _ => {
-                // Any other key dismisses the overlay, then falls through to
-                // normal-mode handling so the key isn't silently swallowed.
-                self.pending_count = None;
+            KeyCode::Char(c) if is_label_char(c) => Action::OverlayInput(c),
+            KeyCode::Char('q') => {
                 self.mode = Mode::Normal;
-                let dismiss = Action::DismissOverlay;
+                Action::Quit
+            }
+            _ => {
+                self.mode = Mode::Normal;
                 let followup = self.handle_normal(key);
                 if followup == Action::None {
-                    dismiss
+                    Action::DismissOverlay
                 } else {
                     followup
                 }
@@ -184,9 +176,21 @@ impl InputHandler {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => Action::PreviewScroll(1),
             KeyCode::Char('k') | KeyCode::Up => Action::PreviewScroll(-1),
-            KeyCode::Esc => {
+            KeyCode::Char('v') | KeyCode::Char(' ') | KeyCode::Esc => {
+                self.mode = Mode::VOverlay;
+                Action::DismissPreview
+            }
+            KeyCode::Char('q') => {
                 self.mode = Mode::Normal;
-                Action::DismissOverlay
+                Action::Quit
+            }
+            KeyCode::Char('p') => {
+                self.mode = Mode::Normal;
+                Action::PrevRecord
+            }
+            KeyCode::Char(c) if is_label_char(c) => {
+                self.mode = Mode::VOverlay;
+                Action::OverlayInput(c)
             }
             _ => Action::None,
         }
@@ -249,16 +253,8 @@ impl InputHandler {
 
             // --- Preview (Phase 2/3) ---
             KeyCode::Char('v') => {
-                // `v` with no prefix opens the field-number overlay; a prefix
-                // present here (e.g. typed before entering VOverlay) previews
-                // directly without requiring the second `v`.
-                match count {
-                    Some(n) => Action::PreviewField(n),
-                    None => {
-                        self.mode = Mode::VOverlay;
-                        Action::ShowFieldNumbers
-                    }
-                }
+                self.mode = Mode::VOverlay;
+                Action::ShowFieldNumbers
             }
             KeyCode::Char('V') => Action::RepeatPreview,
 
@@ -545,51 +541,50 @@ mod tests {
     }
 
     #[test]
-    fn voverlay_digits_then_v_previews_and_enters_preview_mode() {
+    fn voverlay_label_char_emits_overlay_input() {
         let mut h = InputHandler::new();
-        h.handle(ch('v')); // enters VOverlay
+        h.handle(ch('v'));
         assert_eq!(h.mode(), Mode::VOverlay);
-        h.handle(ch('4'));
-        h.handle(ch('2'));
-        assert_eq!(h.handle(ch('v')), Action::PreviewField(42));
-        assert_eq!(h.mode(), Mode::Preview);
+        assert_eq!(h.handle(ch('3')), Action::OverlayInput('3'));
+        assert_eq!(h.mode(), Mode::VOverlay);
     }
 
     #[test]
-    fn voverlay_v_with_no_digits_previews_field_zero() {
+    fn voverlay_v_dismisses_to_normal() {
         let mut h = InputHandler::new();
         h.handle(ch('v'));
-        assert_eq!(h.handle(ch('v')), Action::PreviewField(0));
-        assert_eq!(h.mode(), Mode::Preview);
+        assert_eq!(h.handle(ch('v')), Action::DismissOverlay);
+        assert_eq!(h.mode(), Mode::Normal);
     }
 
     #[test]
     fn voverlay_esc_dismisses_to_normal() {
         let mut h = InputHandler::new();
         h.handle(ch('v'));
-        h.handle(ch('1'));
         assert_eq!(h.handle(key(KeyCode::Esc)), Action::DismissOverlay);
         assert_eq!(h.mode(), Mode::Normal);
-        // pending digits must not leak into normal mode
-        assert_eq!(h.handle(ch('g')), Action::PrevRecord);
     }
 
     #[test]
-    fn voverlay_other_key_dismisses_and_falls_through_to_normal() {
+    fn voverlay_q_quits() {
         let mut h = InputHandler::new();
         h.handle(ch('v'));
-        // 'j' is not part of the overlay's own vocabulary — dismiss and
-        // reinterpret as a normal-mode scroll.
-        assert_eq!(h.handle(ch('j')), Action::ScrollLines(1));
+        assert_eq!(h.handle(ch('q')), Action::Quit);
         assert_eq!(h.mode(), Mode::Normal);
     }
 
     #[test]
-    fn voverlay_unmapped_key_falls_through_to_dismiss_only() {
+    fn voverlay_p_falls_through_to_prev_record() {
         let mut h = InputHandler::new();
         h.handle(ch('v'));
-        // '?' opens help from normal mode, so falling through still produces
-        // an action rather than swallowing the key silently.
+        assert_eq!(h.handle(ch('p')), Action::PrevRecord);
+        assert_eq!(h.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn voverlay_non_label_key_dismisses_and_falls_through() {
+        let mut h = InputHandler::new();
+        h.handle(ch('v'));
         assert_eq!(h.handle(ch('?')), Action::ShowHelp);
         assert_eq!(h.mode(), Mode::Help);
     }
@@ -597,9 +592,7 @@ mod tests {
     #[test]
     fn preview_mode_jk_scrolls() {
         let mut h = InputHandler::new();
-        h.handle(ch('v'));
-        h.handle(ch('v')); // -> Preview
-        assert_eq!(h.mode(), Mode::Preview);
+        h.set_mode(Mode::Preview);
         assert_eq!(h.handle(ch('j')), Action::PreviewScroll(1));
         assert_eq!(h.handle(key(KeyCode::Down)), Action::PreviewScroll(1));
         assert_eq!(h.handle(ch('k')), Action::PreviewScroll(-1));
@@ -607,20 +600,50 @@ mod tests {
     }
 
     #[test]
-    fn preview_mode_esc_dismisses_to_normal() {
+    fn preview_mode_v_dismisses_to_voverlay() {
         let mut h = InputHandler::new();
-        h.handle(ch('v'));
-        h.handle(ch('v'));
-        assert_eq!(h.handle(key(KeyCode::Esc)), Action::DismissOverlay);
+        h.set_mode(Mode::Preview);
+        assert_eq!(h.handle(ch('v')), Action::DismissPreview);
+        assert_eq!(h.mode(), Mode::VOverlay);
+    }
+
+    #[test]
+    fn preview_mode_esc_dismisses_to_voverlay() {
+        let mut h = InputHandler::new();
+        h.set_mode(Mode::Preview);
+        assert_eq!(h.handle(key(KeyCode::Esc)), Action::DismissPreview);
+        assert_eq!(h.mode(), Mode::VOverlay);
+    }
+
+    #[test]
+    fn preview_mode_label_char_emits_overlay_input() {
+        let mut h = InputHandler::new();
+        h.set_mode(Mode::Preview);
+        assert_eq!(h.handle(ch('3')), Action::OverlayInput('3'));
+        assert_eq!(h.mode(), Mode::VOverlay);
+    }
+
+    #[test]
+    fn preview_mode_q_quits() {
+        let mut h = InputHandler::new();
+        h.set_mode(Mode::Preview);
+        assert_eq!(h.handle(ch('q')), Action::Quit);
         assert_eq!(h.mode(), Mode::Normal);
     }
 
     #[test]
-    fn preview_mode_ignores_other_keys() {
+    fn preview_mode_p_dismisses_to_prev_record() {
         let mut h = InputHandler::new();
-        h.handle(ch('v'));
-        h.handle(ch('v'));
-        assert_eq!(h.handle(ch('q')), Action::None);
+        h.set_mode(Mode::Preview);
+        assert_eq!(h.handle(ch('p')), Action::PrevRecord);
+        assert_eq!(h.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn preview_mode_ignores_non_label_keys() {
+        let mut h = InputHandler::new();
+        h.set_mode(Mode::Preview);
+        assert_eq!(h.handle(ch('x')), Action::None);
         assert_eq!(h.mode(), Mode::Preview);
     }
 

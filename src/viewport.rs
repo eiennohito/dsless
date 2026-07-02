@@ -4,6 +4,13 @@ pub trait RowHeightProvider {
     fn line_count(&self, row: usize) -> Option<usize>;
 }
 
+/// Rough estimate of lines-per-record in vertical mode, used before any
+/// rows are actually rendered (so real heights aren't known yet) — e.g. to
+/// size the lookahead window or an initial scroll offset. Not exact: real
+/// records vary in field count, but this is only ever a starting guess
+/// that gets corrected once rendered heights are available.
+pub const VERTICAL_MODE_LINES_PER_ROW_ESTIMATE: usize = 5;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ViewportAnchor {
     row: usize,
@@ -57,7 +64,8 @@ impl ViewportAnchor {
             }
             NavIntent::JumpToMatch { row, match_line } => {
                 self.row = row;
-                self.line_offset = match_line.saturating_sub(ctx.visible_height / 5);
+                self.line_offset = match_line
+                    .saturating_sub(ctx.visible_height / VERTICAL_MODE_LINES_PER_ROW_ESTIMATE);
             }
         }
     }

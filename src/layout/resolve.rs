@@ -21,11 +21,6 @@ impl RenderSpec {
         )
     }
 
-    /// Number of columns the cell cursor can move across; 0 in vertical mode.
-    pub fn column_count(&self) -> usize {
-        self.col_widths().map_or(0, <[usize]>::len)
-    }
-
     /// Column widths if the root is a table-mode struct, else None.
     pub fn col_widths(&self) -> Option<&[usize]> {
         match &self.root.kind {
@@ -54,16 +49,23 @@ impl RenderSpec {
 /// A node in the RenderSpec tree. Each node knows how to render its
 /// corresponding Arrow value — precision for floats, truncation for strings,
 /// column widths for table structs, preview budgets for collections.
+///
+/// `Clone` exists so preview's full-field render can clone a subtree and
+/// mutate only its `Str` leaves (see `preview::unlimit`), rather than
+/// hand-rebuilding every variant.
+#[derive(Clone)]
 pub struct RenderSpecNode {
     pub kind: RenderSpecKind,
 }
 
+#[derive(Clone)]
 pub struct StructChild {
     pub name: String,
     pub schema_idx: usize,
     pub spec: RenderSpecNode,
 }
 
+#[derive(Clone)]
 pub enum RenderSpecKind {
     Scalar,
     Float {
@@ -490,7 +492,6 @@ mod tests {
         let layout = Layout::compute(&mut source);
         let spec = RenderSpec::resolve(&layout, 80);
 
-        assert_eq!(spec.column_count(), 2);
         assert_eq!(spec.col_widths().map(<[usize]>::len), Some(2));
         assert!(spec.column_name(0).is_some());
         assert!(spec.column_name(1).is_some());
@@ -547,7 +548,6 @@ mod tests {
             _ => panic!("root should be Struct"),
         }
 
-        assert_eq!(spec.column_count(), 0, "vertical mode has no cell cursor columns");
         assert_eq!(spec.col_widths(), None);
         assert_eq!(spec.column_name(0), None);
     }

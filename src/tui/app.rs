@@ -1,11 +1,10 @@
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use smallvec::{SmallVec, smallvec};
 
 use crate::cache::RowCache;
 use crate::input::{Action, InputHandler, Mode};
@@ -13,22 +12,21 @@ use crate::layout::{Layout, RenderSpec};
 use crate::preview::SchemaPath;
 use crate::search::SearchState;
 use crate::source::DataSource;
-use crate::tui::cursor::{CursorState, keep_record_visible};
-use crate::tui::help::render_help_popup;
-use crate::tui::preview::{
-    ActivePreview, FieldOverlay, PreviewState, annotate_vertical_line,
-    is_current_row_with_inline_preview, overlay_header_line, render_inline_lines,
-    render_preview_popup,
+use crate::tui::cursor::{CursorState, keep_cursor_visible, line_column_count};
+use crate::tui::draw::draw;
+use crate::tui::label::{LabelMatch, resolve_label};
+use crate::tui::preview::{ActivePreview, FieldOverlay, PreviewPhase, PreviewState, find_line_for_path, resolve_line_path};
+use crate::viewport::{
+    NavContext, NavIntent, VERTICAL_MODE_LINES_PER_ROW_ESTIMATE, ViewportAnchor,
 };
-use crate::tui::style::{style_header_line, style_line};
-use crate::viewport::{NavContext, NavIntent, ViewportAnchor};
 use crate::worker::{WorkerRequest, WorkerResponse, worker_thread};
 
 const SEARCH_BATCH_SIZE: usize = 100;
 
-// ============================================================
-// TUI entry
-// ============================================================
+enum AppEvent {
+    Term(Event),
+    Worker(WorkerResponse),
+}
 
 pub fn run_tui(source: Box<dyn DataSource>) -> Result<()> {
     crossterm::terminal::enable_raw_mode()?;
@@ -70,9 +68,451 @@ fn build_schema_header(source: &dyn DataSource) -> Vec<String> {
     header
 }
 
-// ============================================================
-// Main event loop
-// ============================================================
+/// `pub(super)` (struct and fields) so `tui::draw` — a sibling module split
+/// out to keep this file under the project's line-count guidance — can
+/// read them.
+pub(super) struct App {
+    pub(super) anchor: ViewportAnchor,
+    pub(super) input: InputHandler,
+    pub(super) cursor: CursorState,
+    pub(super) search: Option<SearchState>,
+    pub(super) preview: PreviewState,
+    pub(super) last_visible_row: usize,
+    pub(super) draw_had_cache_miss: bool,
+    /// Text of the line the cursor is currently on, captured by `draw()`.
+    /// `handle_action` reads this (for `CellLeft`/`CellRight` column counting)
+    /// without re-deriving it from the cache, so it's only valid for the
+    /// frame that was just drawn — draw() must run at least once before
+    /// any action that reads this, which the main loop guarantees by
+    /// calling `draw` right after constructing `App` and after every action.
+    pub(super) cursor_line_text: String,
+
+    pub(super) cache: Arc<RowCache>,
+    pub(super) spec: Arc<RenderSpec>,
+    pub(super) schema_header: Vec<String>,
+    pub(super) is_table: bool,
+    pub(super) total_rows: usize,
+    pub(super) visible_height: usize,
+    lookahead: usize,
+    terminal_width: usize,
+    worker_tx: mpsc::Sender<WorkerRequest>,
+}
+
+impl App {
+    fn apply_nav(&mut self, intent: NavIntent) {
+        let ctx = NavContext {
+            heights: &*self.cache,
+            total_rows: self.total_rows,
+            visible_height: self.visible_height,
+        };
+        self.anchor.apply(intent, &ctx);
+    }
+
+    fn dismiss_preview(&mut self) {
+        self.preview.dismiss();
+        if matches!(self.input.mode(), Mode::VOverlay | Mode::Preview) {
+            self.input.set_mode(Mode::Normal);
+        }
+    }
+
+    fn move_cursor_to_path(&mut self, row: usize, path: &SchemaPath) {
+        self.cursor.visible = true;
+        self.cursor.record = row;
+        if self.is_table {
+            self.cursor.selected_col = path.0.first().copied();
+            self.cursor.line = 0;
+        } else if let Some(rendered) = self.cache.get(row) {
+            self.cursor.line = find_line_for_path(&rendered, path).unwrap_or(0);
+            self.cursor.selected_col = None;
+        }
+        self.sync_cursor_visible();
+    }
+
+    fn sync_cursor_visible(&mut self) {
+        let ctx = NavContext {
+            heights: &*self.cache,
+            total_rows: self.total_rows,
+            visible_height: self.visible_height,
+        };
+        keep_cursor_visible(&mut self.anchor, &self.cursor, self.last_visible_row, &ctx);
+    }
+
+    /// Number of columns on the cursor's current line, for `CellLeft`/`CellRight`.
+    /// Top-level table mode already knows the column count from the spec
+    /// (`col_widths`), so it skips text parsing. Vertical mode's cursor line
+    /// might be a nested table row instead, whose width isn't in the
+    /// top-level spec — that case still falls back to counting separators
+    /// in the rendered text.
+    fn current_line_column_count(&self) -> usize {
+        if self.is_table {
+            self.spec.col_widths().map_or(0, <[usize]>::len)
+        } else {
+            line_column_count(&self.cursor_line_text)
+        }
+    }
+
+    /// Move the viewport and cursor onto a search match and make sure its
+    /// row is rendered. Shared by the first-batch jump in
+    /// `handle_worker_response` and by `SearchNext`/`SearchPrev`.
+    fn jump_to_search_match(&mut self, row: usize, match_line: usize) -> Result<()> {
+        self.apply_nav(NavIntent::JumpToMatch { row, match_line });
+        self.cursor.record = row;
+        self.cursor.line = match_line;
+        self.cursor.selected_col = None;
+        self.cursor.visible = true;
+        self.send_render_range()
+    }
+
+    fn send_render_range(&self) -> Result<()> {
+        let rows_needed = if self.is_table {
+            self.visible_height + self.lookahead
+        } else {
+            self.visible_height / VERTICAL_MODE_LINES_PER_ROW_ESTIMATE + self.lookahead
+        };
+        self.worker_tx.send(WorkerRequest::RenderRange {
+            start: self.anchor.row(),
+            end: (self.anchor.row() + rows_needed).min(self.total_rows),
+        })?;
+        Ok(())
+    }
+
+    fn handle_worker_response(&mut self, resp: WorkerResponse) -> Result<()> {
+        match resp {
+            WorkerResponse::RowsReady => {}
+            WorkerResponse::MatchingRecords {
+                matches,
+                exhausted,
+                scanned_up_to,
+            } => {
+                let mut jump = None;
+                if let Some(ref mut s) = self.search {
+                    s.scanning = false;
+                    s.progress = None;
+                    let first_batch = s.matched_rows.is_empty();
+                    s.extend_matches(matches);
+                    s.exhausted = exhausted;
+                    s.scan_cursor = scanned_up_to;
+
+                    if first_batch && let Some(&row) = s.matched_rows.first() {
+                        s.current_idx = 0;
+                        s.update_record_matches(self.cache.get(row));
+                        let match_line = s.record_line_matches.first().copied().unwrap_or(0);
+                        jump = Some((row, match_line));
+                    }
+                }
+                if let Some((row, match_line)) = jump {
+                    self.jump_to_search_match(row, match_line)?;
+                }
+            }
+            WorkerResponse::SearchProgress(row) => {
+                if let Some(ref mut s) = self.search {
+                    s.progress = Some(row);
+                }
+            }
+            WorkerResponse::TruncatedFields { row, fields } => {
+                if matches!(self.preview.phase, PreviewPhase::WaitingForFields { row: r } if r == row)
+                {
+                    self.preview.phase = if fields.is_empty() {
+                        self.input.set_mode(Mode::Normal);
+                        PreviewPhase::Message("no truncated fields".to_string())
+                    } else {
+                        PreviewPhase::Overlay {
+                            overlay: FieldOverlay { row, fields },
+                            label_buf: SmallVec::new(),
+                        }
+                    };
+                }
+            }
+            WorkerResponse::FieldRendered {
+                row,
+                path,
+                name,
+                content,
+                line_count,
+            } => {
+                let matches_pending = matches!(
+                    &self.preview.phase,
+                    PreviewPhase::WaitingForContent { row: r, path: p, .. }
+                        if *r == row && *p == path
+                );
+                if matches_pending {
+                    let fallback = match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle) {
+                        PreviewPhase::WaitingForContent { fallback, .. } => fallback,
+                        _ => unreachable!(),
+                    };
+                    if line_count == 0 {
+                        // Failed/empty render: fall back to the overlay that
+                        // requested it (if any) rather than leaving a
+                        // dangling Normal-mode-but-overlay-drawn mismatch.
+                        self.preview.phase = match fallback {
+                            Some(overlay) => {
+                                self.input.set_mode(Mode::VOverlay);
+                                PreviewPhase::Overlay {
+                                    overlay,
+                                    label_buf: SmallVec::new(),
+                                }
+                            }
+                            None => {
+                                self.input.set_mode(Mode::Normal);
+                                PreviewPhase::Idle
+                            }
+                        };
+                    } else {
+                        let wrap_width = (self.terminal_width * 2 / 3).max(20);
+                        let active = ActivePreview::new(name, content, wrap_width);
+                        self.input.set_mode(Mode::Preview);
+                        self.preview.last_path = Some(path);
+                        self.preview.phase = PreviewPhase::Preview { active, fallback };
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_action(&mut self, action: Action) -> Result<bool> {
+        match action {
+            Action::None => return Ok(false),
+
+            Action::Quit => return Ok(true),
+
+            Action::ScrollLines(n) => {
+                self.dismiss_preview();
+                self.apply_nav(NavIntent::Scroll(n));
+            }
+            Action::ScrollPage(n) => {
+                self.dismiss_preview();
+                self.apply_nav(NavIntent::Scroll(n * self.visible_height as isize));
+            }
+            Action::ScrollHalfPage(n) => {
+                self.dismiss_preview();
+                self.apply_nav(NavIntent::Scroll(n * (self.visible_height / 2) as isize));
+            }
+
+            Action::PrevRecord => {
+                self.dismiss_preview();
+                self.apply_nav(NavIntent::PrevRecordBoundary);
+                self.cursor.jump_to_record(self.anchor.row());
+            }
+            Action::NextRecord => {
+                self.dismiss_preview();
+                self.apply_nav(NavIntent::NextRecordBoundary);
+                self.cursor.jump_to_record(self.anchor.row());
+            }
+            Action::JumpToRecord(target) => {
+                self.dismiss_preview();
+                self.apply_nav(NavIntent::JumpToRecord(target));
+                self.cursor.jump_to_record(self.anchor.row());
+            }
+            Action::JumpPercent(n) => {
+                self.dismiss_preview();
+                let pct = n.min(100);
+                let target = if self.total_rows == 0 {
+                    0
+                } else {
+                    (self.total_rows.saturating_sub(1) * pct) / 100
+                };
+                self.apply_nav(NavIntent::JumpToRecord(target));
+                self.cursor.jump_to_record(self.anchor.row());
+            }
+
+            Action::CursorRecordNext => {
+                self.dismiss_preview();
+                if self.cursor.move_down(&*self.cache, self.total_rows) {
+                    self.sync_cursor_visible();
+                }
+            }
+            Action::CursorRecordPrev => {
+                self.dismiss_preview();
+                if self.cursor.move_up(&*self.cache) {
+                    self.sync_cursor_visible();
+                }
+            }
+            Action::CellLeft => {
+                self.dismiss_preview();
+                let cols = self.current_line_column_count();
+                self.cursor.move_left(cols);
+            }
+            Action::CellRight => {
+                self.dismiss_preview();
+                let cols = self.current_line_column_count();
+                self.cursor.move_right(cols);
+            }
+
+            Action::EnterSearch | Action::SearchQueryChanged | Action::CancelSearch => {}
+            Action::SubmitSearch(query) => {
+                self.dismiss_preview();
+                if !query.is_empty() {
+                    let mut s = SearchState::new(query.clone());
+                    s.scan_cursor = 0;
+                    s.scanning = true;
+                    self.search = Some(s);
+                    self.worker_tx.send(WorkerRequest::FindMatchingRecords {
+                        query,
+                        scan_from: 0,
+                        limit: SEARCH_BATCH_SIZE,
+                    })?;
+                }
+            }
+            Action::SearchNext => {
+                self.dismiss_preview();
+                let mut jump = None;
+                if let Some(ref mut s) = self.search {
+                    if let Some(idx) = s.next_after(self.last_visible_row) {
+                        s.current_idx = idx;
+                        let row = s.matched_rows[idx];
+                        s.update_record_matches(self.cache.get(row));
+                        let match_line = s.record_line_matches.first().copied().unwrap_or(0);
+                        jump = Some((row, match_line));
+                    } else if !s.exhausted {
+                        s.scanning = true;
+                        self.worker_tx.send(WorkerRequest::FindMatchingRecords {
+                            query: s.query.clone(),
+                            scan_from: s.scan_cursor,
+                            limit: SEARCH_BATCH_SIZE,
+                        })?;
+                    }
+                }
+                if let Some((row, match_line)) = jump {
+                    self.jump_to_search_match(row, match_line)?;
+                }
+            }
+            Action::SearchPrev => {
+                self.dismiss_preview();
+                let mut jump = None;
+                if let Some(ref mut s) = self.search
+                    && let Some(idx) = s.prev_before(self.anchor.row())
+                {
+                    s.current_idx = idx;
+                    let row = s.matched_rows[idx];
+                    s.update_record_matches(self.cache.get(row));
+                    let match_line = s.record_line_matches.first().copied().unwrap_or(0);
+                    jump = Some((row, match_line));
+                }
+                if let Some((row, match_line)) = jump {
+                    self.jump_to_search_match(row, match_line)?;
+                }
+            }
+            Action::DismissOverlay => {
+                self.dismiss_preview();
+                self.search = None;
+                self.cursor.hide();
+            }
+            Action::DismissPreview => {
+                self.preview.phase = match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle)
+                {
+                    PreviewPhase::Preview { fallback: Some(overlay), .. } => {
+                        PreviewPhase::Overlay {
+                            overlay,
+                            label_buf: SmallVec::new(),
+                        }
+                    }
+                    _ => {
+                        self.input.set_mode(Mode::Normal);
+                        PreviewPhase::Idle
+                    }
+                };
+            }
+
+            Action::ShowHelp | Action::DismissHelp => {}
+
+            Action::ShowFieldNumbers => {
+                let target = self.anchor.row();
+                self.preview.phase = PreviewPhase::WaitingForFields { row: target };
+                self.worker_tx.send(WorkerRequest::ListTruncatedFields {
+                    row: target,
+                })?;
+            }
+            Action::OverlayInput(c) => {
+                // If we're in Preview with a fallback overlay, promote it
+                // so the label char is processed against the overlay.
+                if let PreviewPhase::Preview { fallback: Some(_), .. } = &self.preview.phase {
+                    self.preview.phase =
+                        match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle) {
+                            PreviewPhase::Preview { fallback: Some(overlay), .. } => {
+                                PreviewPhase::Overlay {
+                                    overlay,
+                                    label_buf: SmallVec::new(),
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                }
+                if let PreviewPhase::Overlay { overlay, label_buf } = &mut self.preview.phase {
+                    label_buf.push(c);
+                    let total = overlay.fields.len();
+                    match resolve_label(label_buf, total) {
+                        LabelMatch::Resolved(idx) => {
+                            if let Some(f) = overlay.fields.get(idx) {
+                                let overlay_row = overlay.row;
+                                let path = f.path.clone();
+                                self.move_cursor_to_path(overlay_row, &path);
+                                let fallback = match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle) {
+                                    PreviewPhase::Overlay { overlay, .. } => Some(overlay),
+                                    _ => unreachable!(),
+                                };
+                                self.preview.phase = PreviewPhase::WaitingForContent {
+                                    row: overlay_row,
+                                    path: path.clone(),
+                                    fallback,
+                                };
+                                self.worker_tx.send(WorkerRequest::RenderFullField {
+                                    row: overlay_row,
+                                    path,
+                                })?;
+                            }
+                        }
+                        LabelMatch::Invalid => label_buf.clear(),
+                        LabelMatch::Incomplete => {}
+                    }
+                }
+            }
+            Action::RepeatPreview => {
+                if let Some(path) = self.preview.last_path.clone() {
+                    self.preview.phase = PreviewPhase::WaitingForContent {
+                        row: self.cursor.record,
+                        path: path.clone(),
+                        fallback: None,
+                    };
+                    self.worker_tx.send(WorkerRequest::RenderFullField {
+                        row: self.cursor.record,
+                        path,
+                    })?;
+                }
+            }
+            Action::PreviewCursorCell => {
+                let path = if self.is_table {
+                    Some(SchemaPath(smallvec![self.cursor.selected_col.unwrap_or(0)]))
+                } else {
+                    self.cache
+                        .get(self.cursor.record)
+                        .and_then(|rendered| resolve_line_path(&rendered, self.cursor.line))
+                };
+                if let Some(path) = path {
+                    self.preview.last_path = Some(path.clone());
+                    self.preview.phase = PreviewPhase::WaitingForContent {
+                        row: self.cursor.record,
+                        path: path.clone(),
+                        fallback: None,
+                    };
+                    self.worker_tx.send(WorkerRequest::RenderFullField {
+                        row: self.cursor.record,
+                        path,
+                    })?;
+                }
+            }
+            Action::PreviewScroll(n) => {
+                if let Some(active) = self.preview.active_preview_mut() {
+                    active.scroll(n, self.visible_height as u16);
+                }
+            }
+        }
+
+        self.send_render_range()?;
+        Ok(false)
+    }
+
+}
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -80,11 +520,10 @@ fn run_app(
 ) -> Result<()> {
     let total_rows = source.total_rows();
     let initial_size = terminal.size()?;
-    let mut terminal_width = initial_size.width as usize;
+    let terminal_width = initial_size.width as usize;
 
-    // Layout is terminal-independent; RenderSpec is resolved per terminal width
     let layout = Layout::compute(source.as_mut());
-    let mut spec = Arc::new(RenderSpec::resolve(&layout, terminal_width));
+    let spec = Arc::new(RenderSpec::resolve(&layout, terminal_width));
     let is_table = spec.is_table();
 
     let vertical_header = if is_table {
@@ -92,7 +531,7 @@ fn run_app(
     } else {
         build_schema_header(source.as_ref())
     };
-    let mut schema_header = if is_table {
+    let schema_header = if is_table {
         spec.render_table_header()
     } else {
         vertical_header.clone()
@@ -100,6 +539,19 @@ fn run_app(
 
     let cache = Arc::new(RowCache::new());
 
+    let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
+
+    // Terminal event reader thread
+    let term_tx = event_tx.clone();
+    thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            if term_tx.send(AppEvent::Term(ev)).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Worker thread
     let (worker_tx, worker_rx) = mpsc::channel();
     let (response_tx, response_rx) = mpsc::channel();
 
@@ -109,568 +561,81 @@ fn run_app(
         worker_thread(source, cache_clone, worker_rx, response_tx, spec_clone);
     });
 
-    // Lookahead margin: extra rows beyond visible to pre-render for smooth scrolling.
-    // In table mode (1 line/row), we need more rows; in vertical mode fewer.
-    let lookahead = if is_table { 20 } else { 5 };
-
-    /// Build a render range: from `start` row, covering enough rows for the screen + margin.
-    /// For table mode each row = 1 line so we need ~visible_height rows.
-    /// For vertical mode each row = many lines so fewer rows suffice.
-    fn render_range_for(
-        start: usize,
-        visible_height: usize,
-        is_table: bool,
-        lookahead: usize,
-        total: usize,
-    ) -> WorkerRequest {
-        let rows_needed = if is_table {
-            visible_height + lookahead
-        } else {
-            // Assume ~10 lines per row in vertical mode; overshoot is fine (cached rows are skipped)
-            visible_height / 5 + lookahead
-        };
-        WorkerRequest::RenderRange {
-            start,
-            end: (start + rows_needed).min(total),
+    // Bridge worker responses into the unified event channel
+    let bridge_tx = event_tx;
+    thread::spawn(move || {
+        while let Ok(resp) = response_rx.recv() {
+            if bridge_tx.send(AppEvent::Worker(resp)).is_err() {
+                break;
+            }
         }
+    });
+
+    let lookahead = if is_table { 20 } else { 5 };
+    let visible_height = initial_size.height.saturating_sub(3) as usize;
+
+    let mut app = App {
+        anchor: ViewportAnchor::top(),
+        input: InputHandler::new(),
+        cursor: CursorState::new(),
+        search: None,
+        preview: PreviewState::new(),
+        last_visible_row: 0,
+        draw_had_cache_miss: false,
+        cursor_line_text: String::new(),
+        cache,
+        spec,
+        schema_header,
+        is_table,
+        total_rows,
+        visible_height,
+        lookahead,
+        terminal_width,
+        worker_tx,
+    };
+
+    app.send_render_range()?;
+    draw(&mut app, terminal)?;
+    if app.draw_had_cache_miss {
+        app.send_render_range()?;
     }
 
-    let mut visible_height = initial_size.height.saturating_sub(3) as usize;
-    worker_tx.send(render_range_for(
-        0,
-        visible_height,
-        is_table,
-        lookahead,
-        total_rows,
-    ))?;
-
-    let mut anchor = ViewportAnchor::top();
-    let mut input = InputHandler::new();
-    let mut cursor = CursorState::new(anchor.row());
-
-    let mut search: Option<SearchState> = None;
-    let mut searching = false; // worker is currently scanning
-    let mut search_progress: Option<usize> = None;
-
-    let mut preview = PreviewState::new();
-    // Tracks which in-flight worker request a response is allowed to apply to,
-    // so a response arriving after the user moved on (dismissed, jumped
-    // record, requested another field) is recognized as stale and dropped.
-    let mut pending_truncation_row: Option<usize> = None;
-    let mut pending_field: Option<(usize, SchemaPath)> = None;
-    // `<N>v` typed directly in Normal mode (no VOverlay shown first) needs
-    // the truncated-field list before it can resolve N to a path; this
-    // records N so the ListTruncatedFields response can act on it.
-    let mut pending_field_selection: Option<usize> = None;
-
-    // Tracks the last visible row from the most recent draw pass
-    let mut last_visible_row: usize = 0;
-    // Set during draw when a cache miss is detected
-    let mut draw_had_cache_miss;
-
-    loop {
-        // Drain background responses
-        while let Ok(resp) = response_rx.try_recv() {
-            match resp {
-                WorkerResponse::RowsReady => {}
-                WorkerResponse::MatchingRecords {
-                    matches,
-                    exhausted,
-                    scanned_up_to,
-                } => {
-                    searching = false;
-                    search_progress = None;
-                    if let Some(ref mut s) = search {
-                        let first_batch = s.matched_rows.is_empty();
-                        s.extend_matches(matches);
-                        s.exhausted = exhausted;
-                        s.scan_cursor = scanned_up_to;
-
-                        if first_batch && let Some(&row) = s.matched_rows.first() {
-                            s.current_idx = 0;
-                            s.update_record_matches(cache.get(row));
-                            let match_line = s.record_line_matches.first().copied().unwrap_or(0);
-                            let ctx = NavContext {
-                                heights: &*cache,
-                                total_rows,
-                                visible_height,
-                            };
-                            anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
-                            cursor.current_record = row;
-                            worker_tx.send(render_range_for(
-                                row,
-                                visible_height,
-                                is_table,
-                                lookahead,
-                                total_rows,
-                            ))?;
-                        }
-                    }
-                }
-                WorkerResponse::SearchProgress(row) => {
-                    search_progress = Some(row);
-                }
-                WorkerResponse::TruncatedFields { row, fields } => {
-                    if pending_truncation_row == Some(row) {
-                        pending_truncation_row = None;
-
-                        if let Some(n) = pending_field_selection.take() {
-                            // Direct `<N>v` from Normal mode: resolve N against
-                            // the list that just arrived instead of showing the overlay.
-                            if let Some(path) = fields.get(n.wrapping_sub(1)).map(|f| f.path.clone()) {
-                                pending_field = Some((row, path.clone()));
-                                worker_tx.send(WorkerRequest::RenderFullField { row, path })?;
-                            }
-                        } else if fields.is_empty() {
-                            preview.message = Some("no truncated fields".to_string());
-                            input.set_mode(Mode::Normal);
-                        } else {
-                            preview.overlay = Some(FieldOverlay { row, fields });
-                        }
-                    }
-                }
-                WorkerResponse::FieldRendered {
-                    row,
-                    path,
-                    name,
-                    content,
-                    line_count,
-                } => {
-                    if pending_field.as_ref() == Some(&(row, path.clone())) {
-                        pending_field = None;
-                        let active = ActivePreview::new(row, name, content, line_count);
-                        if active.is_popup {
-                            input.set_mode(Mode::Preview);
-                        }
-                        preview.active_preview = Some(active);
-                        preview.last_path = Some(path);
-                    }
-                }
+    while let Ok(ev) = event_rx.recv() {
+        match ev {
+            AppEvent::Worker(resp) => {
+                app.handle_worker_response(resp)?;
             }
-        }
-
-        // Draw
-        draw_had_cache_miss = false;
-        terminal.draw(|frame| {
-            let area = frame.area();
-            visible_height = area.height.saturating_sub(3) as usize;
-
-            let mut display: Vec<Line> = Vec::with_capacity(visible_height);
-            let mut lines_remaining = visible_height;
-
-            if is_table || anchor.is_at_top() {
-                for (hi, hline) in schema_header.iter().enumerate() {
-                    if lines_remaining == 0 {
-                        break;
-                    }
-                    let is_header_row = is_table && hi == 0;
-                    let line = if is_header_row {
-                        style_header_line(hline, cursor.selected_col)
-                    } else {
-                        Line::from(Span::styled(
-                            hline.to_string(),
-                            Style::default().fg(Color::Green),
-                        ))
-                    };
-                    display.push(line);
-                    lines_remaining -= 1;
-
-                    if is_header_row
-                        && lines_remaining > 0
-                        && let (Some(overlay), Some(col_widths)) =
-                            (&preview.overlay, spec.col_widths())
-                    {
-                        display.push(overlay_header_line(overlay, col_widths));
-                        lines_remaining -= 1;
-                    }
-                }
-            }
-
-            let mut row = anchor.row();
-            let mut skip = if anchor.is_at_top() {
-                0
-            } else {
-                anchor.line_offset()
-            };
-
-            while lines_remaining > 0 && row < total_rows {
-                if let Some(rendered) = cache.get(row) {
-                    let overlay_here = preview.overlay.as_ref().filter(|o| o.row == row && !is_table);
-                    for li in skip..rendered.line_count() {
-                        if lines_remaining == 0 {
-                            break;
-                        }
-                        let line = rendered.line(li);
-                        let is_current = row == cursor.current_record;
-                        let selected_col = if is_table { cursor.selected_col } else { None };
-                        let styled = match overlay_here {
-                            Some(overlay) => style_line(
-                                &annotate_vertical_line(line, overlay),
-                                row,
-                                &search,
-                                is_current,
-                                selected_col,
-                            ),
-                            None => style_line(line, row, &search, is_current, selected_col),
-                        };
-                        display.push(styled);
-                        lines_remaining -= 1;
-                    }
-                } else {
-                    draw_had_cache_miss = true;
-                    display.push(Line::from(Span::styled(
-                        format!("  Loading row {}...", row),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    lines_remaining -= 1;
-                }
-
-                if is_current_row_with_inline_preview(&preview, row) {
-                    for l in render_inline_lines(preview.active_preview.as_ref().unwrap()) {
-                        if lines_remaining == 0 {
-                            break;
-                        }
-                        display.push(l);
-                        lines_remaining -= 1;
-                    }
-                }
-
-                skip = 0;
-                row += 1;
-            }
-            last_visible_row = row.saturating_sub(1);
-
-            while display.len() < visible_height {
-                display.push(Line::from("~"));
-            }
-
-            // Status bar
-            let status = if input.mode() == Mode::Search {
-                format!("/{}  ", input.search_query())
-            } else if let Some(ref msg) = preview.message {
-                msg.clone()
-            } else if searching {
-                let prog = search_progress.map_or(String::new(), |r| format!(" (at row {})", r));
-                format!("Searching...{}", prog)
-            } else {
-                let pct = if total_rows == 0 {
-                    100
-                } else {
-                    (cursor.current_record + 1) * 100 / total_rows
-                };
-                let count_str = input.pending_count().map_or(String::new(), |n| format!("{}", n));
-                let search_info = if let Some(ref s) = search {
-                    let record_matches = s.record_line_matches.len();
-                    format!(
-                        " | /{}: {} records, {} in record",
-                        s.query,
-                        s.match_count_display(),
-                        record_matches
-                    )
-                } else {
-                    String::new()
-                };
-                let cursor_info = match cursor.selected_col.and_then(|c| spec.column_name(c)) {
-                    Some(name) => format!(" | [col: {}]", name),
-                    None => String::new(),
-                };
-                format!(
-                    "{}Row {}/{} ({}){}{}",
-                    count_str,
-                    cursor.current_record + 1,
-                    total_rows,
-                    pct,
-                    cursor_info,
-                    search_info,
-                )
-            };
-
-            let block = Block::default()
-                .borders(Borders::BOTTOM)
-                .title_bottom(Line::from(status).left_aligned());
-
-            let paragraph = Paragraph::new(display).block(block);
-            frame.render_widget(paragraph, area);
-
-            let mut scrollbar_state = ScrollbarState::new(total_rows).position(anchor.row());
-            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-            frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
-
-            if input.mode() == Mode::Help {
-                render_help_popup(frame, area);
-            }
-            if let Some(active) = preview.active_preview.as_ref().filter(|p| p.is_popup) {
-                render_preview_popup(frame, area, active);
-            }
-        })?;
-
-        // If the draw had cache misses, request the visible range + lookahead.
-        if draw_had_cache_miss {
-            // last_visible_row is the furthest row the draw loop tried to show.
-            // Request from current_row to beyond last_visible_row so the worker
-            // covers all missing rows.
-            let end = last_visible_row + 1 + lookahead;
-            worker_tx.send(WorkerRequest::RenderRange {
-                start: anchor.row(),
-                end: end.min(total_rows),
-            })?;
-        }
-
-        if !event::poll(Duration::from_millis(50))? {
-            continue;
-        }
-
-        match event::read()? {
-            Event::Resize(w, _h) => {
+            AppEvent::Term(Event::Resize(w, _h)) => {
                 let new_width = w as usize;
-                if new_width != terminal_width {
-                    terminal_width = new_width;
-                    spec = Arc::new(RenderSpec::resolve(&layout, terminal_width));
-                    schema_header = if is_table {
-                        spec.render_table_header()
+                if new_width != app.terminal_width {
+                    app.terminal_width = new_width;
+                    app.spec = Arc::new(RenderSpec::resolve(&layout, new_width));
+                    app.schema_header = if is_table {
+                        app.spec.render_table_header()
                     } else {
                         vertical_header.clone()
                     };
-                    cache.clear();
-                    worker_tx.send(WorkerRequest::UpdateSpec(Arc::clone(&spec)))?;
-                    worker_tx.send(render_range_for(
-                        anchor.row(),
-                        visible_height,
-                        is_table,
-                        lookahead,
-                        total_rows,
-                    ))?;
+                    app.cache.clear();
+                    app.worker_tx
+                        .send(WorkerRequest::UpdateSpec(Arc::clone(&app.spec)))?;
+                    app.send_render_range()?;
                 }
             }
-            Event::Key(key) => {
-                input.set_has_active_search(search.is_some());
-                let action = input.handle(key);
-
-                let ctx = NavContext {
-                    heights: &*cache,
-                    total_rows,
-                    visible_height,
-                };
-
-                match action {
-                    Action::None => continue,
-
-                    Action::Quit => {
-                        let _ = worker_tx.send(WorkerRequest::Shutdown);
-                        let _ = worker_handle.join();
-                        break;
-                    }
-
-                    // --- Scroll ---
-                    Action::ScrollLines(n) => {
-                        anchor.apply(NavIntent::Scroll(n), &ctx);
-                    }
-                    Action::ScrollPage(n) => {
-                        anchor.apply(NavIntent::Scroll(n * visible_height as isize), &ctx);
-                    }
-                    Action::ScrollHalfPage(n) => {
-                        anchor.apply(
-                            NavIntent::Scroll(n * (visible_height / 2) as isize),
-                            &ctx,
-                        );
-                    }
-
-                    // --- Record navigation ---
-                    Action::PrevRecord => {
-                        anchor.apply(NavIntent::PrevRecordBoundary, &ctx);
-                        cursor.current_record = anchor.row();
-                    }
-                    Action::NextRecord => {
-                        anchor.apply(NavIntent::NextRecordBoundary, &ctx);
-                        cursor.current_record = anchor.row();
-                    }
-                    Action::JumpToRecord(target) => {
-                        anchor.apply(NavIntent::JumpToRecord(target), &ctx);
-                        cursor.current_record = anchor.row();
-                    }
-                    Action::JumpPercent(n) => {
-                        let pct = n.min(100);
-                        let target = if total_rows == 0 {
-                            0
-                        } else {
-                            (total_rows.saturating_sub(1) * pct) / 100
-                        };
-                        anchor.apply(NavIntent::JumpToRecord(target), &ctx);
-                        cursor.current_record = anchor.row();
-                    }
-
-                    // --- Cell cursor ---
-                    Action::CursorRecordNext => {
-                        if cursor.current_record + 1 < total_rows {
-                            cursor.current_record += 1;
-                            keep_record_visible(
-                                &mut anchor,
-                                cursor.current_record,
-                                last_visible_row,
-                                &ctx,
-                            );
-                        }
-                    }
-                    Action::CursorRecordPrev => {
-                        if cursor.current_record > 0 {
-                            cursor.current_record -= 1;
-                            keep_record_visible(
-                                &mut anchor,
-                                cursor.current_record,
-                                last_visible_row,
-                                &ctx,
-                            );
-                        }
-                    }
-                    Action::CellLeft => cursor.move_left(),
-                    Action::CellRight => cursor.move_right(spec.column_count()),
-
-                    // --- Search ---
-                    Action::EnterSearch | Action::SearchQueryChanged => {}
-                    Action::SubmitSearch(query) => {
-                        if !query.is_empty() {
-                            let mut s = SearchState::new(query.clone());
-                            s.scan_cursor = 0;
-                            search = Some(s);
-                            searching = true;
-                            worker_tx.send(WorkerRequest::FindMatchingRecords {
-                                query,
-                                scan_from: 0,
-                                limit: SEARCH_BATCH_SIZE,
-                            })?;
-                        }
-                    }
-                    Action::CancelSearch => {}
-                    Action::SearchNext => {
-                        if let Some(ref mut s) = search {
-                            if let Some(idx) = s.next_after(last_visible_row) {
-                                s.current_idx = idx;
-                                let row = s.matched_rows[idx];
-                                s.update_record_matches(cache.get(row));
-                                let match_line =
-                                    s.record_line_matches.first().copied().unwrap_or(0);
-                                anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
-                                cursor.current_record = row;
-                                worker_tx.send(render_range_for(
-                                    row,
-                                    visible_height,
-                                    is_table,
-                                    lookahead,
-                                    total_rows,
-                                ))?;
-                            } else if !s.exhausted {
-                                searching = true;
-                                worker_tx.send(WorkerRequest::FindMatchingRecords {
-                                    query: s.query.clone(),
-                                    scan_from: s.scan_cursor,
-                                    limit: SEARCH_BATCH_SIZE,
-                                })?;
-                            }
-                        }
-                    }
-                    Action::SearchPrev => {
-                        if let Some(ref mut s) = search {
-                            if let Some(idx) = s.prev_before(anchor.row()) {
-                                s.current_idx = idx;
-                                let row = s.matched_rows[idx];
-                                s.update_record_matches(cache.get(row));
-                                let match_line =
-                                    s.record_line_matches.first().copied().unwrap_or(0);
-                                anchor.apply(NavIntent::JumpToMatch { row, match_line }, &ctx);
-                                cursor.current_record = row;
-                                worker_tx.send(render_range_for(
-                                    row,
-                                    visible_height,
-                                    is_table,
-                                    lookahead,
-                                    total_rows,
-                                ))?;
-                            }
-                        }
-                    }
-                    Action::DismissOverlay => {
-                        search = None;
-                        searching = false;
-                        search_progress = None;
-                        preview.dismiss();
-                        pending_truncation_row = None;
-                        pending_field = None;
-                        pending_field_selection = None;
-                    }
-
-                    Action::ShowHelp | Action::DismissHelp => {}
-
-                    // --- Preview ---
-                    Action::ShowFieldNumbers => {
-                        preview.message = None;
-                        pending_truncation_row = Some(cursor.current_record);
-                        worker_tx.send(WorkerRequest::ListTruncatedFields {
-                            row: cursor.current_record,
-                        })?;
-                    }
-                    Action::PreviewField(n) => {
-                        match preview
-                            .overlay
-                            .as_ref()
-                            .filter(|o| o.row == cursor.current_record)
-                        {
-                            Some(overlay) => {
-                                if let Some(path) =
-                                    overlay.fields.get(n.wrapping_sub(1)).map(|f| f.path.clone())
-                                {
-                                    pending_field = Some((cursor.current_record, path.clone()));
-                                    worker_tx.send(WorkerRequest::RenderFullField {
-                                        row: cursor.current_record,
-                                        path,
-                                    })?;
-                                }
-                            }
-                            // `<N>v` typed directly in Normal mode: the field list
-                            // for this record hasn't been fetched yet.
-                            None => {
-                                pending_field_selection = Some(n);
-                                pending_truncation_row = Some(cursor.current_record);
-                                worker_tx.send(WorkerRequest::ListTruncatedFields {
-                                    row: cursor.current_record,
-                                })?;
-                            }
-                        }
-                    }
-                    Action::RepeatPreview => {
-                        if let Some(path) = preview.last_path.clone() {
-                            pending_field = Some((cursor.current_record, path.clone()));
-                            worker_tx.send(WorkerRequest::RenderFullField {
-                                row: cursor.current_record,
-                                path,
-                            })?;
-                        }
-                    }
-                    Action::PreviewCursorCell => {
-                        if let Some(col) = cursor.selected_col {
-                            let path = SchemaPath(vec![col]);
-                            pending_field = Some((cursor.current_record, path.clone()));
-                            worker_tx.send(WorkerRequest::RenderFullField {
-                                row: cursor.current_record,
-                                path,
-                            })?;
-                        }
-                    }
-                    Action::PreviewScroll(n) => {
-                        if let Some(ref mut active) = preview.active_preview {
-                            active.scroll(n);
-                        }
-                    }
+            AppEvent::Term(Event::Key(key)) => {
+                app.input.set_has_active_search(app.search.is_some());
+                let action = app.input.handle(key);
+                if app.handle_action(action)? {
+                    let _ = app.worker_tx.send(WorkerRequest::Shutdown);
+                    let _ = worker_handle.join();
+                    break;
                 }
-
-                worker_tx.send(render_range_for(
-                    anchor.row(),
-                    visible_height,
-                    is_table,
-                    lookahead,
-                    total_rows,
-                ))?;
             }
-            _ => {}
+            _ => continue,
+        }
+
+        draw(&mut app, terminal)?;
+        if app.draw_had_cache_miss {
+            app.send_render_range()?;
         }
     }
 

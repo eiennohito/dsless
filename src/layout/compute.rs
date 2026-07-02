@@ -826,7 +826,7 @@ mod tests {
         ];
         let (precision, exponential) = compute_float_precision(&mut values);
         assert!(
-            precision >= 3 && precision <= 5,
+            (3..=5).contains(&precision),
             "coordinates should have precision 3-5, got {}",
             precision
         );
