@@ -117,7 +117,10 @@ fn arbitrary_extension_detected_by_content() {
     let path = write_jsonl(dir.path(), "data.txt", &[r#"{"x":1}"#]);
 
     let (out, ok) = run(&[path.to_str().unwrap()]);
-    assert!(ok, "should detect JSONL from content regardless of extension");
+    assert!(
+        ok,
+        "should detect JSONL from content regardless of extension"
+    );
     assert!(out.contains("Total: 1 row"), "missing row count in:\n{out}");
 }
 

@@ -28,7 +28,11 @@ impl RenderSpec {
     /// Vertical mode: a string field is truncated when its value exceeds
     /// `max_display`; struct fields are walked recursively (building
     /// nested paths) since they render in full rather than as a preview.
-    pub fn find_truncated_fields(&self, batch: &RecordBatch, local_row: usize) -> Vec<TruncatedField> {
+    pub fn find_truncated_fields(
+        &self,
+        batch: &RecordBatch,
+        local_row: usize,
+    ) -> Vec<TruncatedField> {
         let mut out = Vec::new();
         let RenderSpecKind::Struct {
             children,
@@ -45,7 +49,9 @@ impl RenderSpec {
             for (ci, child) in children.iter().enumerate() {
                 let col = batch.column(child.schema_idx);
                 scratch.clear();
-                child.spec.write_cell_preview(&mut scratch, col.as_ref(), local_row);
+                child
+                    .spec
+                    .write_cell_preview(&mut scratch, col.as_ref(), local_row);
                 if display_width(&scratch) > col_widths[ci] {
                     out.push(TruncatedField {
                         path: SchemaPath(smallvec![ci]),
@@ -116,7 +122,9 @@ fn is_value_truncated(node: &RenderSpecNode, array: &dyn Array, row: usize) -> b
         return false;
     }
     match &node.kind {
-        RenderSpecKind::Str { max_display } => display_width(extract_str(array, row)) > *max_display,
+        RenderSpecKind::Str { max_display } => {
+            display_width(extract_str(array, row)) > *max_display
+        }
         RenderSpecKind::Struct { children, .. } => {
             let sa = array.as_any().downcast_ref::<StructArray>().unwrap();
             children
@@ -146,7 +154,13 @@ fn navigate<'a>(
     // Table mode addresses children by their position in `children`
     // (display order); vertical mode addresses by `schema_idx` since
     // nested-struct paths are built from schema_idx values.
-    let is_table = matches!(&spec.root.kind, RenderSpecKind::Struct { table_mode: true, .. });
+    let is_table = matches!(
+        &spec.root.kind,
+        RenderSpecKind::Struct {
+            table_mode: true,
+            ..
+        }
+    );
     let top = if is_table {
         children.get(first)?
     } else {
@@ -213,7 +227,9 @@ fn unlimit_in_place(node: &mut RenderSpecNode) {
         RenderSpecKind::Scalar | RenderSpecKind::Float { .. } => {}
         RenderSpecKind::Str { max_display } => *max_display = usize::MAX,
         RenderSpecKind::Struct { children, .. } => {
-            children.iter_mut().for_each(|c| unlimit_in_place(&mut c.spec));
+            children
+                .iter_mut()
+                .for_each(|c| unlimit_in_place(&mut c.spec));
         }
         RenderSpecKind::List { element } => unlimit_in_place(element),
         RenderSpecKind::Map { key, value } => {
@@ -270,8 +286,14 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) =
-            render_field_full(&spec, batch, local_row, &SchemaPath(smallvec![0]), &mut writer).unwrap();
+        let (name, rendered) = render_field_full(
+            &spec,
+            batch,
+            local_row,
+            &SchemaPath(smallvec![0]),
+            &mut writer,
+        )
+        .unwrap();
         assert_eq!(name, "name");
         let content: String = rendered.lines().collect::<Vec<_>>().join("\n");
         assert!(content.contains(&long), "full string should be untruncated");
@@ -286,7 +308,13 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let result = render_field_full(&spec, batch, local_row, &SchemaPath(smallvec![99]), &mut writer);
+        let result = render_field_full(
+            &spec,
+            batch,
+            local_row,
+            &SchemaPath(smallvec![99]),
+            &mut writer,
+        );
         assert!(result.is_none());
     }
 
@@ -345,7 +373,9 @@ mod tests {
         let (batch, local_row) = source.get_row(0);
         let truncated = spec.find_truncated_fields(batch, local_row);
         assert!(
-            truncated.iter().any(|f| f.path == SchemaPath(smallvec![1, 1])),
+            truncated
+                .iter()
+                .any(|f| f.path == SchemaPath(smallvec![1, 1])),
             "expected nested.desc at path [1, 1] to be flagged, got {:?}",
             truncated.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
@@ -361,8 +391,14 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) =
-            render_field_full(&spec, batch, local_row, &SchemaPath(smallvec![1]), &mut writer).unwrap();
+        let (name, rendered) = render_field_full(
+            &spec,
+            batch,
+            local_row,
+            &SchemaPath(smallvec![1]),
+            &mut writer,
+        )
+        .unwrap();
         assert_eq!(name, "nested");
         assert!(
             !rendered.line(0).trim().is_empty(),
@@ -386,9 +422,14 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) =
-            render_field_full(&spec, batch, local_row, &SchemaPath(smallvec![1, 1]), &mut writer)
-                .unwrap();
+        let (name, rendered) = render_field_full(
+            &spec,
+            batch,
+            local_row,
+            &SchemaPath(smallvec![1, 1]),
+            &mut writer,
+        )
+        .unwrap();
         assert_eq!(name, "nested.desc");
         let content: String = rendered.lines().collect::<Vec<_>>().join("\n");
         assert!(content.contains(&"z".repeat(300)));
@@ -429,14 +470,25 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) =
-            render_field_full(&spec, batch, local_row, &SchemaPath(smallvec![0]), &mut writer).unwrap();
+        let (name, rendered) = render_field_full(
+            &spec,
+            batch,
+            local_row,
+            &SchemaPath(smallvec![0]),
+            &mut writer,
+        )
+        .unwrap();
         assert_eq!(name, "nums");
 
         let lines: Vec<&str> = rendered.lines().collect();
         // "(4 items)" header + one line per element, never inlined as [10, 20, 30, 40].
         assert!(lines[0].contains("4 items"), "got: {:?}", lines);
-        assert_eq!(lines.len(), 5, "expected header + 4 item lines, got {:?}", lines);
+        assert_eq!(
+            lines.len(),
+            5,
+            "expected header + 4 item lines, got {:?}",
+            lines
+        );
         assert!(lines[1].contains("[0]: 10"));
         assert!(lines[4].contains("[3]: 40"));
         assert!(
@@ -474,8 +526,14 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) =
-            render_field_full(&spec, batch, local_row, &SchemaPath(smallvec![0]), &mut writer).unwrap();
+        let (name, rendered) = render_field_full(
+            &spec,
+            batch,
+            local_row,
+            &SchemaPath(smallvec![0]),
+            &mut writer,
+        )
+        .unwrap();
         assert_eq!(name, "counts");
 
         // Map (unlike Struct) always opens with a blank line, even in preview
@@ -483,7 +541,12 @@ mod tests {
         // fields specifically, since only Struct has a leading "field: " on
         // the same line that the blank line separates from.
         let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines.len(), 3, "expected blank line + one line per map entry, got {:?}", lines);
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected blank line + one line per map entry, got {:?}",
+            lines
+        );
         assert!(lines[0].trim().is_empty());
         assert!(lines[1].contains("\"a\": 1"), "got: {:?}", lines);
         assert!(lines[2].contains("\"b\": 2"), "got: {:?}", lines);
@@ -514,8 +577,7 @@ mod tests {
             outer.data_type().clone(),
             false,
         )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(outer) as Arc<dyn Array>]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(outer) as Arc<dyn Array>]).unwrap();
         let mut source = FakeDataSource::from_batch(batch);
 
         let layout = Layout::compute(&mut source);
@@ -523,8 +585,14 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) =
-            render_field_full(&spec, batch, local_row, &SchemaPath(smallvec![0]), &mut writer).unwrap();
+        let (name, rendered) = render_field_full(
+            &spec,
+            batch,
+            local_row,
+            &SchemaPath(smallvec![0]),
+            &mut writer,
+        )
+        .unwrap();
         assert_eq!(name, "outer");
 
         let lines: Vec<&str> = rendered.lines().collect();

@@ -1,12 +1,16 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
 use anyhow::Result;
 
 use crate::input::Mode;
 use crate::tui::app::App;
 use crate::tui::help::render_help_popup;
-use crate::tui::preview::{LABEL_STYLE, overlay_header_line, overlay_label_for_line, render_preview};
+use crate::tui::preview::{
+    LABEL_STYLE, overlay_header_line, overlay_label_for_line, render_preview,
+};
 use crate::tui::style::{style_header_line, style_line};
 
 /// Render the current `App` state into the terminal frame.
@@ -45,10 +49,17 @@ pub(super) fn draw(
                 let line = if is_header_row {
                     style_header_line(
                         hline,
-                        if app_ref.cursor.visible { app_ref.cursor.selected_col } else { None },
+                        if app_ref.cursor.visible {
+                            app_ref.cursor.selected_col
+                        } else {
+                            None
+                        },
                     )
                 } else {
-                    Line::from(Span::styled(hline.to_string(), Style::default().fg(Color::Green)))
+                    Line::from(Span::styled(
+                        hline.to_string(),
+                        Style::default().fg(Color::Green),
+                    ))
                 };
                 display.push(line);
                 lines_remaining -= 1;
@@ -67,27 +78,38 @@ pub(super) fn draw(
         }
 
         let mut row = app_ref.anchor.row();
-        let mut skip = if app_ref.anchor.is_at_top() { 0 } else { app_ref.anchor.line_offset() };
+        let mut skip = if app_ref.anchor.is_at_top() {
+            0
+        } else {
+            app_ref.anchor.line_offset()
+        };
 
         while lines_remaining > 0 && row < app_ref.total_rows {
             if let Some(rendered) = app_ref.cache.get(row) {
-                let overlay_here =
-                    app_ref.preview.overlay().filter(|o| o.row == row && !app_ref.is_table);
+                let overlay_here = app_ref
+                    .preview
+                    .overlay()
+                    .filter(|o| o.row == row && !app_ref.is_table);
                 for li in skip..rendered.line_count() {
                     if lines_remaining == 0 {
                         break;
                     }
                     let line = rendered.line(li);
                     let is_cursor_line = app_ref.cursor.is_on(row, li);
-                    let selected_col = if is_cursor_line { app_ref.cursor.selected_col } else { None };
+                    let selected_col = if is_cursor_line {
+                        app_ref.cursor.selected_col
+                    } else {
+                        None
+                    };
                     if is_cursor_line {
                         clt.clear();
                         clt.push_str(line);
                         cursor_screen_y = screen_line;
                     }
-                    let label_prefix = overlay_here
-                        .and_then(|overlay| overlay_label_for_line(line, overlay));
-                    let mut styled = style_line(line, row, &app_ref.search, is_cursor_line, selected_col);
+                    let label_prefix =
+                        overlay_here.and_then(|overlay| overlay_label_for_line(line, overlay));
+                    let mut styled =
+                        style_line(line, row, &app_ref.search, is_cursor_line, selected_col);
                     if let Some(label) = label_prefix {
                         styled.spans.insert(0, Span::styled(label, LABEL_STYLE));
                     }
@@ -144,7 +166,10 @@ pub(super) fn draw(
             } else {
                 String::new()
             };
-            let cursor_info = match app_ref.cursor.selected_col.and_then(|c| app_ref.spec.column_name(c))
+            let cursor_info = match app_ref
+                .cursor
+                .selected_col
+                .and_then(|c| app_ref.spec.column_name(c))
             {
                 Some(name) => format!(" | [col: {}]", name),
                 None => String::new(),

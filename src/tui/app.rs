@@ -15,7 +15,9 @@ use crate::source::DataSource;
 use crate::tui::cursor::{CursorState, keep_cursor_visible, line_column_count};
 use crate::tui::draw::draw;
 use crate::tui::label::{LabelMatch, resolve_label};
-use crate::tui::preview::{ActivePreview, FieldOverlay, PreviewPhase, PreviewState, find_line_for_path, resolve_line_path};
+use crate::tui::preview::{
+    ActivePreview, FieldOverlay, PreviewPhase, PreviewState, find_line_for_path, resolve_line_path,
+};
 use crate::viewport::{
     NavContext, NavIntent, VERTICAL_MODE_LINES_PER_ROW_ESTIMATE, ViewportAnchor,
 };
@@ -236,10 +238,11 @@ impl App {
                         if *r == row && *p == path
                 );
                 if matches_pending {
-                    let fallback = match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle) {
-                        PreviewPhase::WaitingForContent { fallback, .. } => fallback,
-                        _ => unreachable!(),
-                    };
+                    let fallback =
+                        match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle) {
+                            PreviewPhase::WaitingForContent { fallback, .. } => fallback,
+                            _ => unreachable!(),
+                        };
                     if line_count == 0 {
                         // Failed/empty render: fall back to the overlay that
                         // requested it (if any) rather than leaving a
@@ -399,19 +402,20 @@ impl App {
                 self.cursor.hide();
             }
             Action::DismissPreview => {
-                self.preview.phase = match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle)
-                {
-                    PreviewPhase::Preview { fallback: Some(overlay), .. } => {
-                        PreviewPhase::Overlay {
+                self.preview.phase =
+                    match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle) {
+                        PreviewPhase::Preview {
+                            fallback: Some(overlay),
+                            ..
+                        } => PreviewPhase::Overlay {
                             overlay,
                             label_buf: SmallVec::new(),
+                        },
+                        _ => {
+                            self.input.set_mode(Mode::Normal);
+                            PreviewPhase::Idle
                         }
-                    }
-                    _ => {
-                        self.input.set_mode(Mode::Normal);
-                        PreviewPhase::Idle
-                    }
-                };
+                    };
             }
 
             Action::ShowHelp | Action::DismissHelp => {}
@@ -419,22 +423,25 @@ impl App {
             Action::ShowFieldNumbers => {
                 let target = self.anchor.row();
                 self.preview.phase = PreviewPhase::WaitingForFields { row: target };
-                self.worker_tx.send(WorkerRequest::ListTruncatedFields {
-                    row: target,
-                })?;
+                self.worker_tx
+                    .send(WorkerRequest::ListTruncatedFields { row: target })?;
             }
             Action::OverlayInput(c) => {
                 // If we're in Preview with a fallback overlay, promote it
                 // so the label char is processed against the overlay.
-                if let PreviewPhase::Preview { fallback: Some(_), .. } = &self.preview.phase {
+                if let PreviewPhase::Preview {
+                    fallback: Some(_), ..
+                } = &self.preview.phase
+                {
                     self.preview.phase =
                         match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle) {
-                            PreviewPhase::Preview { fallback: Some(overlay), .. } => {
-                                PreviewPhase::Overlay {
-                                    overlay,
-                                    label_buf: SmallVec::new(),
-                                }
-                            }
+                            PreviewPhase::Preview {
+                                fallback: Some(overlay),
+                                ..
+                            } => PreviewPhase::Overlay {
+                                overlay,
+                                label_buf: SmallVec::new(),
+                            },
                             _ => unreachable!(),
                         };
                 }
@@ -447,7 +454,10 @@ impl App {
                                 let overlay_row = overlay.row;
                                 let path = f.path.clone();
                                 self.move_cursor_to_path(overlay_row, &path);
-                                let fallback = match std::mem::replace(&mut self.preview.phase, PreviewPhase::Idle) {
+                                let fallback = match std::mem::replace(
+                                    &mut self.preview.phase,
+                                    PreviewPhase::Idle,
+                                ) {
                                     PreviewPhase::Overlay { overlay, .. } => Some(overlay),
                                     _ => unreachable!(),
                                 };
@@ -511,7 +521,6 @@ impl App {
         self.send_render_range()?;
         Ok(false)
     }
-
 }
 
 fn run_app(

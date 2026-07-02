@@ -158,7 +158,12 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
-        assert!(!line.spans[0].style.add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            !line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]

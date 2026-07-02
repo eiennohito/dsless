@@ -136,4 +136,3 @@ impl DataSource for ParquetSource {
         (self.rg_cache.get(&key).unwrap(), local_row)
     }
 }
-

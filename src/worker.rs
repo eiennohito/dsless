@@ -202,25 +202,30 @@ fn render_full_field(
     path: SchemaPath,
     tx: &mpsc::Sender<WorkerResponse>,
 ) {
-    let result = source
-        .ensure_loaded(row)
-        .ok()
-        .and_then(|()| {
-            let (batch, local_row) = source.get_row(row);
-            preview::render_field_full(spec, batch, local_row, &path, writer)
-        });
+    let result = source.ensure_loaded(row).ok().and_then(|()| {
+        let (batch, local_row) = source.get_row(row);
+        preview::render_field_full(spec, batch, local_row, &path, writer)
+    });
 
     match result {
         Some((name, rendered)) => {
             let content = rendered.lines().collect::<Vec<_>>().join("\n");
             let line_count = rendered.line_count();
             let _ = tx.send(WorkerResponse::FieldRendered {
-                row, path, name, content, line_count,
+                row,
+                path,
+                name,
+                content,
+                line_count,
             });
         }
         None => {
             let _ = tx.send(WorkerResponse::FieldRendered {
-                row, path, name: String::new(), content: String::new(), line_count: 0,
+                row,
+                path,
+                name: String::new(),
+                content: String::new(),
+                line_count: 0,
             });
         }
     }

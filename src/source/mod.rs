@@ -62,8 +62,12 @@ fn sniff_format(path: &Path) -> Result<Option<Format>> {
 
 fn classify_path(path: &Path) -> Result<(Format, Vec<std::path::PathBuf>)> {
     if path.is_file() {
-        let format = sniff_format(path)?
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine format of {:?}: content not recognized as Parquet or JSONL", path))?;
+        let format = sniff_format(path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot determine format of {:?}: content not recognized as Parquet or JSONL",
+                path
+            )
+        })?;
         return Ok((format, vec![path.to_path_buf()]));
     }
     if !path.is_dir() {

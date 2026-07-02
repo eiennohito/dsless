@@ -114,7 +114,9 @@ impl RenderSpecNode {
                     w.enter_field(depth as u8, child.schema_idx as u16);
                     w.guide(depth);
                     let _ = write!(w, "{}: ", child.name);
-                    child.spec.render_value(col.as_ref(), row, w, depth, RenderMode::Normal);
+                    child
+                        .spec
+                        .render_value(col.as_ref(), row, w, depth, RenderMode::Normal);
                 }
             }
             _ => unreachable!("root spec must be Struct"),
@@ -172,7 +174,9 @@ impl RenderSpecNode {
                     w.enter_field((depth + 1) as u8, child.schema_idx as u16);
                     w.guide(depth + 1);
                     let _ = write!(w, "{}: ", child.name);
-                    child.spec.render_value(col.as_ref(), row, w, depth + 1, mode);
+                    child
+                        .spec
+                        .render_value(col.as_ref(), row, w, depth + 1, mode);
                 }
             }
             RenderSpecKind::List { element } => {
@@ -945,12 +949,12 @@ mod tests {
 
         assert!(rendered.field_path(0).is_empty(), "row header has no field");
         assert_eq!(&rendered.field_path(1)[..], &[0], "id is field 0");
-        assert_eq!(&rendered.field_path(2)[..], &[1], "nested's own line is field 1");
         assert_eq!(
-            &rendered.field_path(3)[..],
-            &[1, 0],
-            "nested.x is [1, 0]"
+            &rendered.field_path(2)[..],
+            &[1],
+            "nested's own line is field 1"
         );
+        assert_eq!(&rendered.field_path(3)[..], &[1, 0], "nested.x is [1, 0]");
         assert_eq!(
             &rendered.field_path(4)[..],
             &[1, 1],

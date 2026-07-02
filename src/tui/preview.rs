@@ -1,5 +1,7 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use smallvec::{SmallVec, smallvec};
 
 use crate::preview::{SchemaPath, TruncatedField};
@@ -69,9 +71,8 @@ impl PreviewState {
     pub fn overlay(&self) -> Option<&FieldOverlay> {
         match &self.phase {
             PreviewPhase::Overlay { overlay, .. } => Some(overlay),
-            PreviewPhase::WaitingForContent { fallback, .. } | PreviewPhase::Preview { fallback, .. } => {
-                fallback.as_ref()
-            }
+            PreviewPhase::WaitingForContent { fallback, .. }
+            | PreviewPhase::Preview { fallback, .. } => fallback.as_ref(),
             _ => None,
         }
     }
@@ -122,10 +123,6 @@ impl ActivePreview {
             lines: wrap_content(&content, wrap_width),
             scroll_offset: 0,
         }
-    }
-
-    pub fn scrollable(&self, visible_height: u16) -> bool {
-        self.lines.len() > visible_height.saturating_sub(2) as usize
     }
 
     pub fn scroll(&mut self, delta: isize, visible_height: u16) {
@@ -310,7 +307,10 @@ pub fn render_preview(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None),
-            popup_area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 0 }),
+            popup_area.inner(ratatui::layout::Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
             &mut state,
         );
     }
@@ -391,11 +391,27 @@ mod tests {
 
         // line 0: "── Row 0 ──"; line 1: "id: 7"; line 2: "│ nested: ";
         // line 3: "│ │ x: 1"; line 4: "│ │ desc: \"d\""
-        assert_eq!(resolve_line_path(&rendered, 0), None, "row header has no field");
-        assert_eq!(resolve_line_path(&rendered, 1), Some(SchemaPath(smallvec![0])));
-        assert_eq!(resolve_line_path(&rendered, 2), Some(SchemaPath(smallvec![1])));
-        assert_eq!(resolve_line_path(&rendered, 3), Some(SchemaPath(smallvec![1, 0])));
-        assert_eq!(resolve_line_path(&rendered, 4), Some(SchemaPath(smallvec![1, 1])));
+        assert_eq!(
+            resolve_line_path(&rendered, 0),
+            None,
+            "row header has no field"
+        );
+        assert_eq!(
+            resolve_line_path(&rendered, 1),
+            Some(SchemaPath(smallvec![0]))
+        );
+        assert_eq!(
+            resolve_line_path(&rendered, 2),
+            Some(SchemaPath(smallvec![1]))
+        );
+        assert_eq!(
+            resolve_line_path(&rendered, 3),
+            Some(SchemaPath(smallvec![1, 0]))
+        );
+        assert_eq!(
+            resolve_line_path(&rendered, 4),
+            Some(SchemaPath(smallvec![1, 1]))
+        );
     }
 
     #[test]
@@ -462,13 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn scrollable_depends_on_visible_height() {
-        let p = ActivePreview::new("f".into(), "1\n2\n3\n4\n5".into(), 40);
-        assert!(p.scrollable(5));  // inner 3 < 5 lines
-        assert!(!p.scrollable(20)); // inner 18 > 5 lines
-    }
-
-    #[test]
     fn preview_state_dismiss_keeps_last_path() {
         let mut state = PreviewState::new();
         state.last_path = Some(SchemaPath(smallvec![3]));
@@ -480,7 +489,10 @@ mod tests {
     fn preview_state_dismiss_resets_phase_to_idle() {
         let mut state = PreviewState::new();
         state.phase = PreviewPhase::Overlay {
-            overlay: FieldOverlay { row: 0, fields: vec![field(vec![0], "a")] },
+            overlay: FieldOverlay {
+                row: 0,
+                fields: vec![field(vec![0], "a")],
+            },
             label_buf: SmallVec::new(),
         };
         state.dismiss();
@@ -491,7 +503,10 @@ mod tests {
     #[test]
     fn overlay_accessor_sees_fallback_during_waiting_for_content_and_preview() {
         let mut state = PreviewState::new();
-        let overlay = FieldOverlay { row: 5, fields: vec![field(vec![1], "b")] };
+        let overlay = FieldOverlay {
+            row: 5,
+            fields: vec![field(vec![1], "b")],
+        };
         state.phase = PreviewPhase::WaitingForContent {
             row: 5,
             path: SchemaPath(smallvec![1]),
@@ -499,7 +514,10 @@ mod tests {
         };
         assert_eq!(state.overlay().map(|o| o.row), Some(5));
 
-        let overlay = FieldOverlay { row: 5, fields: vec![field(vec![1], "b")] };
+        let overlay = FieldOverlay {
+            row: 5,
+            fields: vec![field(vec![1], "b")],
+        };
         state.phase = PreviewPhase::Preview {
             active: ActivePreview::new("b".into(), "content".into(), 40),
             fallback: Some(overlay),
@@ -534,5 +552,4 @@ mod tests {
         );
         assert_eq!(overlay_label_for_line("│ b: 42", &overlay), None);
     }
-
 }
