@@ -57,7 +57,7 @@ Later (#2), this is the type that gets persisted to config for per-schema displa
 
 Layout + terminal width → concrete rendering decisions. Recomputed on resize. This is what rendering consumes. Contains:
 - Column widths distributed across available space
-- Column display order (bounded columns left, unbounded rightmost)
+- Column display order (highest-spread column moved rightmost)
 - Precomputed row prefixes (guide chars + padding)
 - Float precision and string truncation limits at every schema level
 
@@ -69,13 +69,19 @@ Building a Layout from data uses a schema-shaped accumulator tree (`LayoutBuilde
 
 1. **Build** the tree from the schema — one accumulator node per schema field, no data yet.
 2. **Feed** sampled rows through the tree — each node accumulates width statistics, float values, string lengths.
-3. **Resolve** the accumulated stats into a `LayoutNode` tree — p80 widths, float precision, table-mode decisions.
+3. **Resolve** the accumulated stats into a `LayoutNode` tree — full width histograms (`WidthProfile`, queried at arbitrary percentiles later), float precision, table-mode decisions.
 
 This handles arbitrary nesting depth (Struct→Map→Struct→List→...) because `feed()` recurses naturally through the data.
 
 ### Column width strategy
 
-For table-mode structs, columns are classified as bounded or unbounded based on `max_sampled_width / p80_width`. Bounded columns (ratio < 1.5) get their `max(max_width, p80).min(p80 * 1.1)` — tight fit with minimal waste. The least-bounded column moves to the rightmost position and receives all remaining terminal width. This avoids even splits where both a narrow ID column and a wide map column get 50% each.
+Each `LayoutNode` stores a `WidthProfile` — the full sorted sample of cell widths from sampling. Column allocation queries this histogram at arbitrary percentiles rather than relying on precomputed summaries.
+
+**Fixed vs variable**: columns where p80 ≥ max are fixed-width (every cell is the same width). These get exactly their width first. The remaining budget goes to variable columns.
+
+**Variable allocation**: proportional to `sqrt(p80)`. Sqrt dampens huge columns so a 400-char description doesn't starve a 15-char ID column. Columns are floored at `MIN_COL` (8) and capped at their sampled max, with surplus redistributed.
+
+**Rightmost placement**: the column with the highest `p95/p50` spread ratio (>1.5) is moved to the rightmost display position. Stable columns on the left are easier to scan.
 
 ## Lazy loading
 

@@ -12,11 +12,54 @@ pub struct Layout {
     pub root: LayoutNode,
 }
 
+/// Width distribution from sampled cell widths.
+/// Drives column allocation — the full histogram lets resolve see what
+/// percentage of cells fit at any given column width.
+pub struct WidthProfile {
+    /// Sorted cell widths from sampling.
+    sorted: Vec<usize>,
+}
+
+impl WidthProfile {
+    fn from_accum(mut accum: WidthAccum) -> Self {
+        accum.widths.sort_unstable();
+        Self {
+            sorted: accum.widths,
+        }
+    }
+
+    fn from_sorted_vec(mut widths: Vec<usize>) -> Self {
+        widths.sort_unstable();
+        Self { sorted: widths }
+    }
+
+    fn empty() -> Self {
+        Self { sorted: vec![] }
+    }
+
+    /// Percentile (0–100). Returns 1 if no samples.
+    pub fn percentile(&self, pct: usize) -> usize {
+        if self.sorted.is_empty() {
+            return 1;
+        }
+        let idx = (self.sorted.len() * pct / 100).min(self.sorted.len() - 1);
+        self.sorted[idx].max(1)
+    }
+
+    pub fn max(&self) -> usize {
+        self.sorted.last().copied().unwrap_or(1)
+    }
+
+    #[cfg(test)]
+    pub fn from_sorted(sorted: Vec<usize>) -> Self {
+        Self::from_sorted_vec(sorted)
+    }
+}
+
 /// Per-field statistics derived from data sampling.
 /// Drives width allocation and format decisions during RenderSpec resolution.
 pub struct LayoutNode {
-    pub natural_width: usize,
-    pub max_width: usize,
+    pub widths: WidthProfile,
     pub header_width: usize,
     pub kind: LayoutKind,
 }
@@ -75,33 +118,17 @@ impl Layout {
 /// Track how wide values are across sampled rows.
 struct WidthAccum {
     widths: Vec<usize>,
-    max: usize,
 }
 
 impl WidthAccum {
     fn new() -> Self {
         Self {
             widths: Vec::new(),
-            max: 0,
         }
     }
 
     fn record(&mut self, width: usize) {
         self.widths.push(width);
-        if width > self.max {
-            self.max = width;
-        }
-    }
-
-    /// p80 + 10%, or 1 if empty. Sorts in place — call only when done accumulating.
-    fn p80_plus10(&mut self) -> usize {
-        if self.widths.is_empty() {
-            return 1;
-        }
-        self.widths.sort_unstable();
-        let p80_idx = (self.widths.len() * 4 / 5).min(self.widths.len().saturating_sub(1));
-        let p80 = self.widths[p80_idx];
-        (p80 + p80 / 10).max(1)
     }
 }
 
@@ -302,11 +329,8 @@ impl LayoutBuilder {
             })
             .collect();
 
-        let natural_width: usize = resolved.iter().map(|(_, n)| n.natural_width).sum();
-        let max_width: usize = resolved.iter().map(|(_, n)| n.max_width).sum();
         LayoutNode {
-            natural_width,
-            max_width,
+            widths: WidthProfile::empty(),
             header_width: 0,
             kind: LayoutKind::Struct {
                 children: resolved,
@@ -317,20 +341,18 @@ impl LayoutBuilder {
 
     fn resolve(self, header_width: usize) -> LayoutNode {
         match self {
-            LayoutBuilder::Scalar { mut widths } => LayoutNode {
-                natural_width: widths.p80_plus10(),
-                max_width: widths.max,
+            LayoutBuilder::Scalar { widths } => LayoutNode {
+                widths: WidthProfile::from_accum(widths),
                 header_width,
                 kind: LayoutKind::Scalar,
             },
             LayoutBuilder::Float {
-                mut widths,
+                widths,
                 mut values,
             } => {
                 let (precision, exponential) = compute_float_precision(&mut values);
                 LayoutNode {
-                    natural_width: widths.p80_plus10(),
-                    max_width: widths.max,
+                    widths: WidthProfile::from_accum(widths),
                     header_width,
                     kind: LayoutKind::Float {
                         precision,
@@ -339,20 +361,19 @@ impl LayoutBuilder {
                 }
             }
             LayoutBuilder::Str {
-                mut widths,
-                mut lengths,
+                widths,
+                lengths,
             } => {
-                let max_display = resolve_str_max_display(&mut lengths);
+                let max_display = resolve_str_max_display(lengths);
                 LayoutNode {
-                    natural_width: widths.p80_plus10(),
-                    max_width: widths.max,
+                    widths: WidthProfile::from_accum(widths),
                     header_width,
                     kind: LayoutKind::Str { max_display },
                 }
             }
             LayoutBuilder::Struct {
                 children,
-                mut widths,
+                widths,
             } => {
                 let table_ok = children.iter().all(|(_, child)| !has_nested_struct(child));
                 let resolved: Vec<(String, LayoutNode)> = children
@@ -364,8 +385,7 @@ impl LayoutBuilder {
                     })
                     .collect();
                 LayoutNode {
-                    natural_width: widths.p80_plus10(),
-                    max_width: widths.max,
+                    widths: WidthProfile::from_accum(widths),
                     header_width,
                     kind: LayoutKind::Struct {
                         children: resolved,
@@ -375,12 +395,11 @@ impl LayoutBuilder {
             }
             LayoutBuilder::List {
                 element,
-                mut widths,
+                widths,
             } => {
                 let element_node = element.resolve(0);
                 LayoutNode {
-                    natural_width: widths.p80_plus10(),
-                    max_width: widths.max,
+                    widths: WidthProfile::from_accum(widths),
                     header_width,
                     kind: LayoutKind::List {
                         element: Box::new(element_node),
@@ -390,13 +409,12 @@ impl LayoutBuilder {
             LayoutBuilder::Map {
                 key,
                 value,
-                mut widths,
+                widths,
             } => {
                 let key_node = key.resolve(0);
                 let value_node = value.resolve(0);
                 LayoutNode {
-                    natural_width: widths.p80_plus10(),
-                    max_width: widths.max,
+                    widths: WidthProfile::from_accum(widths),
                     header_width,
                     kind: LayoutKind::Map {
                         key: Box::new(key_node),
@@ -408,14 +426,12 @@ impl LayoutBuilder {
     }
 }
 
-/// Resolve string max_display from accumulated lengths.
-fn resolve_str_max_display(lengths: &mut [usize]) -> usize {
+fn resolve_str_max_display(lengths: Vec<usize>) -> usize {
     if lengths.is_empty() {
         return DEFAULT_STR_MAX_DISPLAY;
     }
-    lengths.sort_unstable();
-    let p80_idx = (lengths.len() * 4 / 5).min(lengths.len().saturating_sub(1));
-    let p80 = lengths[p80_idx];
+    let profile = WidthProfile::from_sorted_vec(lengths);
+    let p80 = profile.percentile(80);
     (p80 + p80 / 10).clamp(1, DEFAULT_STR_MAX_DISPLAY)
 }
 
@@ -904,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_natural_width_sampling() {
-        // Verify that natural_width uses p80 + 10%
+        // Verify that p80 reflects the typical data, not outliers
         let schema = make_schema(vec![Field::new("val", DataType::Int32, false)]);
         // Create values with varying widths: mostly 1-2 digits, a few 5-digit
         let values: Vec<i32> = (0..100)
@@ -921,7 +937,7 @@ mod tests {
 
         match &layout.root.kind {
             LayoutKind::Struct { children, .. } => {
-                let w = children[0].1.natural_width;
+                let w = children[0].1.widths.percentile(80);
                 // p80 of mostly single-digit numbers should be small.
                 // The 20% outliers (99999 = 5 chars) shouldn't make it huge.
                 assert!(
