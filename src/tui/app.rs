@@ -8,10 +8,11 @@ use smallvec::SmallVec;
 
 use crate::cache::RowCache;
 use crate::input::{Action, InputHandler, Mode};
-use crate::layout::{Layout, RenderSpec};
+use crate::layout::RenderSpec;
 use crate::preview::{self, DataPath};
 use crate::search::SearchState;
 use crate::source::DataSource;
+use crate::tui::copy::osc52_copy;
 use crate::tui::cursor::{CursorDir, CursorState, keep_cursor_visible};
 use crate::tui::draw::draw;
 use crate::tui::label::{LabelMatch, resolve_label};
@@ -22,6 +23,7 @@ use crate::viewport::{
 use crate::worker::{WorkerRequest, WorkerResponse, worker_thread};
 
 const SEARCH_BATCH_SIZE: usize = 100;
+const COPY_WIDTH: usize = 100;
 
 enum AppEvent {
     Term(Event),
@@ -79,6 +81,7 @@ pub(super) struct App {
     pub(super) preview: PreviewState,
     pub(super) last_visible_row: usize,
     pub(super) draw_had_cache_miss: bool,
+    pub(super) status_message: Option<&'static str>,
 
     pub(super) cache: Arc<RowCache>,
     pub(super) spec: Arc<RenderSpec>,
@@ -143,6 +146,14 @@ impl App {
         self.cursor.clamp_selected_col(col_count);
     }
 
+    fn cursor_cell_path(&self) -> Option<DataPath> {
+        self.cache.get(self.cursor.record).and_then(|rendered| {
+            rendered
+                .node_for_position(self.cursor.line, self.cursor.selected_col)
+                .map(|n| rendered.data_path(n))
+        })
+    }
+
     /// Move the viewport and cursor onto a search match and make sure its
     /// row is rendered. Shared by the first-batch jump in
     /// `handle_worker_response` and by `SearchNext`/`SearchPrev`.
@@ -199,6 +210,12 @@ impl App {
             WorkerResponse::SearchProgress(row) => {
                 if let Some(ref mut s) = self.search {
                     s.progress = Some(row);
+                }
+            }
+            WorkerResponse::CopyReady(text) => {
+                if !text.is_empty() {
+                    osc52_copy(&text);
+                    self.status_message = Some("copied");
                 }
             }
             WorkerResponse::FieldRendered {
@@ -505,12 +522,7 @@ impl App {
                 }
             }
             Action::PreviewCursorCell => {
-                let path = self.cache.get(self.cursor.record).and_then(|rendered| {
-                    rendered
-                        .node_for_position(self.cursor.line, self.cursor.selected_col)
-                        .map(|n| rendered.data_path(n))
-                });
-                if let Some(path) = path {
+                if let Some(path) = self.cursor_cell_path() {
                     self.preview.last_path = Some(path.clone());
                     self.preview.phase = PreviewPhase::WaitingForContent {
                         row: self.cursor.record,
@@ -528,6 +540,24 @@ impl App {
                     active.scroll(n, self.visible_height as u16);
                 }
             }
+            Action::Copy => {
+                self.status_message = None;
+                if let Some(active) = self.preview.active_preview() {
+                    osc52_copy(&active.content);
+                    self.status_message = Some("copied");
+                } else if self.cursor.selected_col.is_some() {
+                    if let Some(path) = self.cursor_cell_path() {
+                        self.worker_tx.send(WorkerRequest::RenderCellForCopy {
+                            row: self.cursor.record,
+                            path,
+                        })?;
+                    }
+                } else {
+                    self.worker_tx.send(WorkerRequest::RenderForCopy {
+                        row: self.cursor.record,
+                    })?;
+                }
+            }
         }
 
         self.send_render_range()?;
@@ -543,8 +573,9 @@ fn run_app(
     let initial_size = terminal.size()?;
     let terminal_width = initial_size.width as usize;
 
-    let layout = Layout::compute(source.as_mut());
+    let layout = crate::layout::Layout::compute(source.as_mut());
     let spec = Arc::new(RenderSpec::resolve(&layout, terminal_width));
+    let copy_spec = RenderSpec::resolve(&layout, COPY_WIDTH);
     let is_table = spec.is_table();
 
     let vertical_header = if is_table {
@@ -579,7 +610,14 @@ fn run_app(
     let cache_clone = Arc::clone(&cache);
     let spec_clone = Arc::clone(&spec);
     let worker_handle = thread::spawn(move || {
-        worker_thread(source, cache_clone, worker_rx, response_tx, spec_clone);
+        worker_thread(
+            source,
+            cache_clone,
+            worker_rx,
+            response_tx,
+            spec_clone,
+            copy_spec,
+        );
     });
 
     // Bridge worker responses into the unified event channel
@@ -603,6 +641,7 @@ fn run_app(
         preview: PreviewState::new(),
         last_visible_row: 0,
         draw_had_cache_miss: false,
+        status_message: None,
         cache,
         spec,
         schema_header,
@@ -644,6 +683,7 @@ fn run_app(
                 }
             }
             AppEvent::Term(Event::Key(key)) => {
+                app.status_message = None;
                 app.input.set_has_active_search(app.search.is_some());
                 let action = app.input.handle(key);
                 if app.handle_action(action)? {

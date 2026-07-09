@@ -747,12 +747,15 @@ mod tests {
             Field::new("desc", DataType::Utf8, false),
         ]);
 
-        let long_a: Vec<&str> =
-            (0..20).map(|_| "aaaa_bbbb_cccc_dddd_eeee_ffff_gggg_hhhh").collect();
-        let long_b: Vec<&str> =
-            (0..20).map(|_| "1111_2222_3333_4444_5555_6666_7777_8888").collect();
-        let very_long: Vec<String> =
-            (0..20).map(|i| format!("description_{}_", i).repeat(20)).collect();
+        let long_a: Vec<&str> = (0..20)
+            .map(|_| "aaaa_bbbb_cccc_dddd_eeee_ffff_gggg_hhhh")
+            .collect();
+        let long_b: Vec<&str> = (0..20)
+            .map(|_| "1111_2222_3333_4444_5555_6666_7777_8888")
+            .collect();
+        let very_long: Vec<String> = (0..20)
+            .map(|i| format!("description_{}_", i).repeat(20))
+            .collect();
         let very_long_refs: Vec<&str> = very_long.iter().map(|s| s.as_str()).collect();
         let ids: Vec<&str> = (0..20).map(|_| "short").collect();
 
@@ -782,7 +785,8 @@ mod tests {
                 assert!(
                     total <= 80,
                     "table width {} exceeds terminal width 80; col_widths={:?}",
-                    total, col_widths,
+                    total,
+                    col_widths,
                 );
                 for &w in col_widths {
                     assert!(w >= 1, "column width must be positive, got {}", w);
@@ -814,7 +818,10 @@ mod tests {
 
     #[test]
     fn test_alloc_all_fit() {
-        let nodes = [node_h(&[5, 5, 5, 5, 5], 2), node_h(&[10, 10, 10, 10, 10], 3)];
+        let nodes = [
+            node_h(&[5, 5, 5, 5, 5], 2),
+            node_h(&[10, 10, 10, 10, 10], 3),
+        ];
         let refs: Vec<&LayoutNode> = nodes.iter().collect();
         let result = allocate_from_histograms(&refs, 40);
         assert_eq!(result, vec![5, 10]);
@@ -843,12 +850,14 @@ mod tests {
         assert!(
             ratio < 10.0,
             "sqrt dampening should keep ratio well below 40: got {:.1} ({:?})",
-            ratio, result,
+            ratio,
+            result,
         );
         assert!(
             ratio > 2.0,
             "larger column should still get meaningfully more: got {:.1} ({:?})",
-            ratio, result,
+            ratio,
+            result,
         );
     }
 
@@ -863,7 +872,9 @@ mod tests {
         assert!(
             result[0] >= MIN_COL,
             "small column (max={}) should get at least MIN_COL={}, got {}",
-            nodes[0].widths.max(), MIN_COL, result[0],
+            nodes[0].widths.max(),
+            MIN_COL,
+            result[0],
         );
     }
 
@@ -886,7 +897,12 @@ mod tests {
 
     #[test]
     fn test_alloc_total_respects_available() {
-        let nodes = [node(&[13; 50]), node(&[47; 50]), node(&[89; 50]), node(&[201; 50])];
+        let nodes = [
+            node(&[13; 50]),
+            node(&[47; 50]),
+            node(&[89; 50]),
+            node(&[201; 50]),
+        ];
         let refs: Vec<&LayoutNode> = nodes.iter().collect();
         let n = refs.len();
         for available in [50, 77, 100, 200] {
@@ -897,7 +913,11 @@ mod tests {
             assert!(
                 total <= limit,
                 "total {} exceeds limit {} (available={}, min_possible={}) for {:?}",
-                total, limit, available, min_possible, result,
+                total,
+                limit,
+                available,
+                min_possible,
+                result,
             );
         }
     }
@@ -1086,7 +1106,10 @@ mod tests {
                 assert!(
                     total <= term_width,
                     "nested table at depth {} overflows: {} > {} (col_widths={:?})",
-                    depth, total, term_width, col_widths,
+                    depth,
+                    total,
+                    term_width,
+                    col_widths,
                 );
                 for child in children {
                     assert_nested_tables_fit(&child.spec, term_width, depth + 1);

@@ -580,6 +580,10 @@ impl RenderedRow {
         LineIter { row: self, idx: 0 }
     }
 
+    pub fn to_text(&self) -> String {
+        self.lines().collect::<Vec<_>>().join("\n")
+    }
+
     pub fn byte_size(&self) -> usize {
         self.buf.len()
             + self.line_starts.len() * std::mem::size_of::<usize>()

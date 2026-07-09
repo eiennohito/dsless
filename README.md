@@ -55,6 +55,8 @@ Vim-style. `j`/`k` (or arrows) move the cursor, `J`/`K` page, `h`/`l` (or arrows
 
 **Preview**: `v` shows an overlay of truncated fields — type the label to expand. `V` repeats last preview on a new record. `Space` previews the field under the cursor. `j`/`k` scroll inside a preview, `v`/`Space`/`Esc` dismiss.
 
+**Copy**: `Y` copies to clipboard via OSC 52 — the current record (re-rendered at 100 columns), the selected cell's full value, or the preview content, depending on context. Requires a terminal that supports OSC 52 (most modern terminals; tmux needs `set -g set-clipboard on`).
+
 `?` for the full keymap inside the TUI.
 
 ## AI-assisted

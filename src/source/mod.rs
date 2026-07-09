@@ -27,6 +27,11 @@ pub trait DataSource: Send {
     /// Get the batch and local row index for a global row.
     /// Must call `ensure_loaded` first.
     fn get_row(&mut self, global_row: usize) -> (&RecordBatch, usize);
+
+    fn load_row(&mut self, global_row: usize) -> Result<(&RecordBatch, usize)> {
+        self.ensure_loaded(global_row)?;
+        Ok(self.get_row(global_row))
+    }
 }
 
 enum Format {

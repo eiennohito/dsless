@@ -151,6 +151,8 @@ pub(super) fn draw(
         // Status bar
         let status = if app_ref.input.mode() == Mode::Search {
             format!("/{}  ", app_ref.input.search_query())
+        } else if let Some(msg) = app_ref.status_message {
+            msg.to_string()
         } else if let Some(msg) = app_ref.preview.message() {
             msg.to_string()
         } else if app_ref.search.as_ref().is_some_and(|s| s.scanning) {

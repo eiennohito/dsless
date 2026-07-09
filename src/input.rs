@@ -65,6 +65,9 @@ pub enum Action {
     PreviewCursorCell,
     PreviewScroll(isize),
 
+    // Copy
+    Copy,
+
     // Meta
     ShowHelp,
     DismissHelp,
@@ -158,6 +161,10 @@ impl InputHandler {
                 self.mode = Mode::Normal;
                 Action::DismissOverlay
             }
+            KeyCode::Char('Y') => {
+                self.mode = Mode::Normal;
+                Action::Copy
+            }
             KeyCode::Char(c) if is_label_char(c) => Action::OverlayInput(c),
             KeyCode::Char('q') => {
                 self.mode = Mode::Normal;
@@ -177,6 +184,7 @@ impl InputHandler {
 
     fn handle_preview(&mut self, key: KeyEvent) -> Action {
         match key.code {
+            KeyCode::Char('Y') => Action::Copy,
             KeyCode::Char('j') | KeyCode::Down => Action::PreviewScroll(1),
             KeyCode::Char('k') | KeyCode::Up => Action::PreviewScroll(-1),
             KeyCode::Char('v') | KeyCode::Char(' ') | KeyCode::Esc => {
@@ -262,6 +270,7 @@ impl InputHandler {
                 Action::ShowFieldNumbers
             }
             KeyCode::Char('V') => Action::RepeatPreview,
+            KeyCode::Char('Y') => Action::Copy,
 
             // --- Search ---
             KeyCode::Char('/') => {
@@ -654,6 +663,30 @@ mod tests {
         let mut h = InputHandler::new();
         h.set_mode(Mode::Preview);
         assert_eq!(h.handle(ch('x')), Action::None);
+        assert_eq!(h.mode(), Mode::Preview);
+    }
+
+    #[test]
+    fn copy_in_normal_mode() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(ch('Y')), Action::Copy);
+        assert_eq!(h.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn copy_in_voverlay_dismisses_to_normal() {
+        let mut h = InputHandler::new();
+        h.handle(ch('v'));
+        assert_eq!(h.mode(), Mode::VOverlay);
+        assert_eq!(h.handle(ch('Y')), Action::Copy);
+        assert_eq!(h.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn copy_in_preview_stays_in_preview() {
+        let mut h = InputHandler::new();
+        h.set_mode(Mode::Preview);
+        assert_eq!(h.handle(ch('Y')), Action::Copy);
         assert_eq!(h.mode(), Mode::Preview);
     }
 

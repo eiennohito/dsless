@@ -122,9 +122,7 @@ struct WidthAccum {
 
 impl WidthAccum {
     fn new() -> Self {
-        Self {
-            widths: Vec::new(),
-        }
+        Self { widths: Vec::new() }
     }
 
     fn record(&mut self, width: usize) {
@@ -346,10 +344,7 @@ impl LayoutBuilder {
                 header_width,
                 kind: LayoutKind::Scalar,
             },
-            LayoutBuilder::Float {
-                widths,
-                mut values,
-            } => {
+            LayoutBuilder::Float { widths, mut values } => {
                 let (precision, exponential) = compute_float_precision(&mut values);
                 LayoutNode {
                     widths: WidthProfile::from_accum(widths),
@@ -360,10 +355,7 @@ impl LayoutBuilder {
                     },
                 }
             }
-            LayoutBuilder::Str {
-                widths,
-                lengths,
-            } => {
+            LayoutBuilder::Str { widths, lengths } => {
                 let max_display = resolve_str_max_display(lengths);
                 LayoutNode {
                     widths: WidthProfile::from_accum(widths),
@@ -371,10 +363,7 @@ impl LayoutBuilder {
                     kind: LayoutKind::Str { max_display },
                 }
             }
-            LayoutBuilder::Struct {
-                children,
-                widths,
-            } => {
+            LayoutBuilder::Struct { children, widths } => {
                 let table_ok = children.iter().all(|(_, child)| !has_nested_struct(child));
                 let resolved: Vec<(String, LayoutNode)> = children
                     .into_iter()
@@ -393,10 +382,7 @@ impl LayoutBuilder {
                     },
                 }
             }
-            LayoutBuilder::List {
-                element,
-                widths,
-            } => {
+            LayoutBuilder::List { element, widths } => {
                 let element_node = element.resolve(0);
                 LayoutNode {
                     widths: WidthProfile::from_accum(widths),
@@ -406,11 +392,7 @@ impl LayoutBuilder {
                     },
                 }
             }
-            LayoutBuilder::Map {
-                key,
-                value,
-                widths,
-            } => {
+            LayoutBuilder::Map { key, value, widths } => {
                 let key_node = key.resolve(0);
                 let value_node = value.resolve(0);
                 LayoutNode {

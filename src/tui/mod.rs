@@ -1,4 +1,5 @@
 mod app;
+mod copy;
 mod cursor;
 mod draw;
 mod help;

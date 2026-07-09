@@ -140,6 +140,16 @@ Two-level, async:
 
 `n` skips all matches visible on the current screen and jumps to the next off-screen match. If more matches are needed and the scan isn't exhausted, requests another batch from the worker.
 
+## Copy
+
+`Y` copies to the system clipboard via OSC 52 (`tui/copy.rs`). Three sources, dispatched contextually:
+
+1. **Preview open** → copies `ActivePreview.content` (the original untruncated field value, not the word-wrapped display lines). Immediate, no worker round-trip.
+2. **Cell selected** → `WorkerRequest::RenderCellForCopy` renders the full field value via `render_field_full`, responds with `CopyReady(String)`.
+3. **Whole record** → `WorkerRequest::RenderForCopy` re-renders the record at a fixed 100-column width using a pre-cached `copy_spec` (resolved once at startup, not per-request). Responds with `CopyReady(String)`.
+
+The worker thread owns a `WorkerCtx` struct bundling source, cache, writer, spec, copy_spec, and the response channel. The copy spec is a `RenderSpec` resolved from the `Layout` at `COPY_WIDTH` — separate from the terminal-width spec so copy output is consistent regardless of the user's terminal size.
+
 ## Event loop
 
 `tui::app::run_app` drives everything through one `AppEvent` channel with two producers:

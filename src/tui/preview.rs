@@ -139,15 +139,18 @@ impl FieldOverlay {
 
 pub struct ActivePreview {
     pub name: String,
+    pub content: String,
     pub lines: Vec<String>,
     pub scroll_offset: usize,
 }
 
 impl ActivePreview {
     pub fn new(name: String, content: String, wrap_width: usize) -> Self {
+        let lines = wrap_content(&content, wrap_width);
         ActivePreview {
             name,
-            lines: wrap_content(&content, wrap_width),
+            content,
+            lines,
             scroll_offset: 0,
         }
     }

@@ -54,6 +54,12 @@ pub fn render_help_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
         Line::from("  Esc           clear search + cursor"),
         Line::from(""),
         Line::from(Span::styled(
+            " Copy",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  Y             copy (record/cell/preview)"),
+        Line::from(""),
+        Line::from(Span::styled(
             " Other",
             Style::default().add_modifier(Modifier::BOLD),
         )),
