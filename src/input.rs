@@ -30,7 +30,6 @@ pub enum Action {
 
     // Viewport scrolling
     ScrollLines(isize),
-    ScrollPage(isize),
     ScrollHalfPage(isize),
 
     // Record navigation
@@ -48,11 +47,15 @@ pub enum Action {
     SearchPrev,
     DismissOverlay,
 
-    // Cell cursor
-    CellLeft,
-    CellRight,
+    // Row/line cursor
     CursorRecordNext,
     CursorRecordPrev,
+    CursorPageDown,
+    CursorPageUp,
+
+    // Cell (column) cursor
+    CellLeft,
+    CellRight,
 
     // Preview
     ShowFieldNumbers,
@@ -224,15 +227,15 @@ impl InputHandler {
             KeyCode::Char('u') if ctrl => Action::ScrollHalfPage(-1),
             KeyCode::Char('h') if ctrl => Action::CellLeft,
             KeyCode::Char('l') if ctrl => Action::CellRight,
-            KeyCode::Char('j') if ctrl => Action::CursorRecordNext,
-            KeyCode::Char('k') if ctrl => Action::CursorRecordPrev,
+            KeyCode::Char('j') if ctrl => Action::ScrollLines(1),
+            KeyCode::Char('k') if ctrl => Action::ScrollLines(-1),
 
-            KeyCode::Char('j') | KeyCode::Down => Action::ScrollLines(1),
-            KeyCode::Char('k') | KeyCode::Up => Action::ScrollLines(-1),
-            KeyCode::Char('J') | KeyCode::PageDown => Action::ScrollPage(1),
-            KeyCode::Char('K') | KeyCode::PageUp => Action::ScrollPage(-1),
+            KeyCode::Char('j') | KeyCode::Down => Action::CursorRecordNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::CursorRecordPrev,
+            KeyCode::Char('J') | KeyCode::PageDown => Action::CursorPageDown,
+            KeyCode::Char('K') | KeyCode::PageUp => Action::CursorPageUp,
 
-            // --- Cell cursor (Phase 2/3) ---
+            // --- Cell cursor ---
             KeyCode::Char(' ') => Action::PreviewCursorCell,
             KeyCode::Char('h') => Action::CellLeft,
             KeyCode::Char('l') => Action::CellRight,
@@ -483,16 +486,29 @@ mod tests {
     }
 
     #[test]
+    fn cursor_movement_keys() {
+        let mut h = InputHandler::new();
+        assert_eq!(h.handle(ch('j')), Action::CursorRecordNext);
+        assert_eq!(h.handle(key(KeyCode::Down)), Action::CursorRecordNext);
+        assert_eq!(h.handle(ch('k')), Action::CursorRecordPrev);
+        assert_eq!(h.handle(key(KeyCode::Up)), Action::CursorRecordPrev);
+        assert_eq!(h.handle(ch('J')), Action::CursorPageDown);
+        assert_eq!(h.handle(key(KeyCode::PageDown)), Action::CursorPageDown);
+        assert_eq!(h.handle(ch('K')), Action::CursorPageUp);
+        assert_eq!(h.handle(key(KeyCode::PageUp)), Action::CursorPageUp);
+    }
+
+    #[test]
     fn scroll_keys() {
         let mut h = InputHandler::new();
-        assert_eq!(h.handle(ch('j')), Action::ScrollLines(1));
-        assert_eq!(h.handle(key(KeyCode::Down)), Action::ScrollLines(1));
-        assert_eq!(h.handle(ch('k')), Action::ScrollLines(-1));
-        assert_eq!(h.handle(key(KeyCode::Up)), Action::ScrollLines(-1));
-        assert_eq!(h.handle(ch('J')), Action::ScrollPage(1));
-        assert_eq!(h.handle(key(KeyCode::PageDown)), Action::ScrollPage(1));
-        assert_eq!(h.handle(ch('K')), Action::ScrollPage(-1));
-        assert_eq!(h.handle(key(KeyCode::PageUp)), Action::ScrollPage(-1));
+        assert_eq!(
+            h.handle(key_ctrl(KeyCode::Char('j'))),
+            Action::ScrollLines(1)
+        );
+        assert_eq!(
+            h.handle(key_ctrl(KeyCode::Char('k'))),
+            Action::ScrollLines(-1)
+        );
         assert_eq!(
             h.handle(key_ctrl(KeyCode::Char('d'))),
             Action::ScrollHalfPage(1)
@@ -510,14 +526,6 @@ mod tests {
         assert_eq!(h.handle(key_ctrl(KeyCode::Char('h'))), Action::CellLeft);
         assert_eq!(h.handle(ch('l')), Action::CellRight);
         assert_eq!(h.handle(key_ctrl(KeyCode::Char('l'))), Action::CellRight);
-        assert_eq!(
-            h.handle(key_ctrl(KeyCode::Char('j'))),
-            Action::CursorRecordNext
-        );
-        assert_eq!(
-            h.handle(key_ctrl(KeyCode::Char('k'))),
-            Action::CursorRecordPrev
-        );
     }
 
     #[test]

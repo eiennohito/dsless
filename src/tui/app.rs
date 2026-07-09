@@ -12,12 +12,10 @@ use crate::layout::{Layout, RenderSpec};
 use crate::preview::{self, DataPath};
 use crate::search::SearchState;
 use crate::source::DataSource;
-use crate::tui::cursor::{CursorState, keep_cursor_visible, line_column_count};
+use crate::tui::cursor::{CursorDir, CursorState, keep_cursor_visible, line_column_count};
 use crate::tui::draw::draw;
 use crate::tui::label::{LabelMatch, resolve_label};
-use crate::tui::preview::{
-    ActivePreview, FieldOverlay, PreviewPhase, PreviewState,
-};
+use crate::tui::preview::{ActivePreview, FieldOverlay, PreviewPhase, PreviewState};
 use crate::viewport::{
     NavContext, NavIntent, VERTICAL_MODE_LINES_PER_ROW_ESTIMATE, ViewportAnchor,
 };
@@ -124,16 +122,16 @@ impl App {
             self.cursor.line = rendered.line_for_node(node).unwrap_or(0);
             self.cursor.selected_col = None;
         }
-        self.sync_cursor_visible();
+        self.sync_cursor_visible(CursorDir::Down);
     }
 
-    fn sync_cursor_visible(&mut self) {
+    fn sync_cursor_visible(&mut self, dir: CursorDir) {
         let ctx = NavContext {
             heights: &*self.cache,
             total_rows: self.total_rows,
             visible_height: self.visible_height,
         };
-        keep_cursor_visible(&mut self.anchor, &self.cursor, self.last_visible_row, &ctx);
+        keep_cursor_visible(&mut self.anchor, &self.cursor, &ctx, dir);
     }
 
     /// Number of columns on the cursor's current line, for `CellLeft`/`CellRight`.
@@ -266,10 +264,6 @@ impl App {
                 self.dismiss_preview();
                 self.apply_nav(NavIntent::Scroll(n));
             }
-            Action::ScrollPage(n) => {
-                self.dismiss_preview();
-                self.apply_nav(NavIntent::Scroll(n * self.visible_height as isize));
-            }
             Action::ScrollHalfPage(n) => {
                 self.dismiss_preview();
                 self.apply_nav(NavIntent::Scroll(n * (self.visible_height / 2) as isize));
@@ -302,16 +296,40 @@ impl App {
                 self.cursor.jump_to_record(self.anchor.row());
             }
 
-            Action::CursorRecordNext => {
+            Action::CursorRecordNext | Action::CursorPageDown => {
                 self.dismiss_preview();
-                if self.cursor.move_down(&*self.cache, self.total_rows) {
-                    self.sync_cursor_visible();
+                let count = if action == Action::CursorPageDown {
+                    self.visible_height
+                } else {
+                    1
+                };
+                if !self.cursor.visible {
+                    self.cursor.place_at_first_visible(&self.anchor);
+                } else if self
+                    .cursor
+                    .step(CursorDir::Down, count, &*self.cache, self.total_rows)
+                {
+                    self.sync_cursor_visible(CursorDir::Down);
                 }
             }
-            Action::CursorRecordPrev => {
+            Action::CursorRecordPrev | Action::CursorPageUp => {
                 self.dismiss_preview();
-                if self.cursor.move_up(&*self.cache) {
-                    self.sync_cursor_visible();
+                let count = if action == Action::CursorPageUp {
+                    self.visible_height
+                } else {
+                    1
+                };
+                if !self.cursor.visible {
+                    self.cursor.place_at_last_visible(
+                        &self.anchor,
+                        &*self.cache,
+                        self.visible_height,
+                    );
+                } else if self
+                    .cursor
+                    .step(CursorDir::Up, count, &*self.cache, self.total_rows)
+                {
+                    self.sync_cursor_visible(CursorDir::Up);
                 }
             }
             Action::CellLeft => {
@@ -404,7 +422,7 @@ impl App {
             Action::ShowHelp | Action::DismissHelp => {}
 
             Action::ShowFieldNumbers => {
-                let target = self.anchor.row();
+                let target = self.cursor.record;
                 if let Some(rendered) = self.cache.get(target) {
                     let fields = preview::expandable_fields(&rendered, &self.spec);
                     if fields.is_empty() {

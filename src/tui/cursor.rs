@@ -101,6 +101,70 @@ impl CursorState {
         self.selected_col = Some(self.selected_col.map_or(0, |c| (c + 1).min(max_col)));
     }
 
+    /// Place cursor on the first visible line (viewport top).
+    pub fn place_at_first_visible(&mut self, anchor: &ViewportAnchor) {
+        self.record = anchor.row();
+        self.line = anchor.line_offset();
+        self.selected_col = None;
+        self.visible = true;
+    }
+
+    /// Place cursor on the last visible line (viewport bottom).
+    pub fn place_at_last_visible(
+        &mut self,
+        anchor: &ViewportAnchor,
+        heights: &dyn RowHeightProvider,
+        visible_height: usize,
+    ) {
+        let mut row = anchor.row();
+        let mut line = anchor.line_offset();
+        let mut remaining = visible_height.saturating_sub(1);
+        while remaining > 0 {
+            let row_height = heights.line_count(row).unwrap_or(1);
+            let lines_left_in_row = row_height.saturating_sub(line);
+            if remaining < lines_left_in_row {
+                line += remaining;
+                break;
+            }
+            remaining -= lines_left_in_row;
+            row += 1;
+            line = 0;
+            if heights.line_count(row).is_none() {
+                // Past known data — back up to last known position
+                row -= 1;
+                line = heights.line_count(row).unwrap_or(1).saturating_sub(1);
+                break;
+            }
+        }
+        self.record = row;
+        self.line = line;
+        self.selected_col = None;
+        self.visible = true;
+    }
+
+    /// Move cursor N lines in the given direction. Returns true if it moved
+    /// at least once.
+    pub fn step(
+        &mut self,
+        dir: CursorDir,
+        count: usize,
+        heights: &dyn RowHeightProvider,
+        total_rows: usize,
+    ) -> bool {
+        let mut moved = false;
+        for _ in 0..count {
+            let ok = match dir {
+                CursorDir::Down => self.move_down(heights, total_rows),
+                CursorDir::Up => self.move_up(heights),
+            };
+            if !ok {
+                break;
+            }
+            moved = true;
+        }
+        moved
+    }
+
     /// Check if the cursor is on this (row, line_index) pair.
     pub fn is_on(&self, row: usize, line_index: usize) -> bool {
         self.visible && self.record == row && self.line == line_index
@@ -122,21 +186,98 @@ pub fn line_column_count(line: &str) -> usize {
     line.matches(COLUMN_SEPARATOR).count() + 1
 }
 
-/// Scroll the viewport anchor just enough to keep the cursor's current
-/// line visible. Only scrolls by 1 line at a time — feels like the cursor
-/// drags the viewport edge, never re-centering.
+/// Compute the cursor's screen-line distance from the viewport top.
+/// Returns None if the cursor is above the viewport.
+fn cursor_screen_line(
+    anchor: &ViewportAnchor,
+    cursor: &CursorState,
+    heights: &dyn RowHeightProvider,
+) -> Option<usize> {
+    if cursor.record < anchor.row() {
+        return None;
+    }
+    if cursor.record == anchor.row() {
+        return cursor.line.checked_sub(anchor.line_offset());
+    }
+    let anchor_row_height = heights.line_count(anchor.row()).unwrap_or(1);
+    let mut lines = anchor_row_height.saturating_sub(anchor.line_offset());
+    for row in (anchor.row() + 1)..cursor.record {
+        lines += heights.line_count(row).unwrap_or(1);
+    }
+    lines += cursor.line;
+    Some(lines)
+}
+
+/// Direction the cursor just moved — controls which margin is enforced
+/// when the cursor is on-screen. Off-screen cursors always snap.
+#[derive(Clone, Copy)]
+pub enum CursorDir {
+    Down,
+    Up,
+}
+
+/// Scroll the viewport to keep the cursor visible with a scrolloff margin.
+///
+/// Margin = min(10, visible_height / 10).
+///
+/// - **Off-screen** (above or below viewport): always snap the viewport to
+///   place the cursor at the appropriate margin edge. No-backjump doesn't
+///   apply — the cursor must be visible.
+/// - **On-screen**: enforce margin only in the movement direction. Moving
+///   down can only scroll down; moving up can only scroll up. This prevents
+///   backjumps after operations that deliberately place the cursor at a
+///   viewport edge.
 pub fn keep_cursor_visible(
     anchor: &mut ViewportAnchor,
     cursor: &CursorState,
-    last_visible_row: usize,
     ctx: &NavContext,
+    dir: CursorDir,
 ) {
-    if cursor.record < anchor.row()
-        || (cursor.record == anchor.row() && cursor.line < anchor.line_offset())
-    {
-        anchor.apply(NavIntent::Scroll(-1), ctx);
-    } else if cursor.record > last_visible_row {
-        anchor.apply(NavIntent::Scroll(1), ctx);
+    let margin = 10usize.min(ctx.visible_height / 10);
+    let top_target = margin;
+    let bottom_target = ctx.visible_height.saturating_sub(margin + 1);
+
+    match cursor_screen_line(anchor, cursor, ctx.heights) {
+        None => {
+            snap_cursor_to_line(anchor, cursor, ctx, top_target);
+        }
+        Some(screen_line) if screen_line >= ctx.visible_height => {
+            snap_cursor_to_line(anchor, cursor, ctx, bottom_target);
+        }
+        Some(screen_line) => match dir {
+            CursorDir::Down => {
+                if screen_line > bottom_target {
+                    let scroll = screen_line - bottom_target;
+                    anchor.apply(NavIntent::Scroll(scroll as isize), ctx);
+                }
+            }
+            CursorDir::Up => {
+                if screen_line < top_target {
+                    let scroll = top_target - screen_line;
+                    anchor.apply(NavIntent::Scroll(-(scroll as isize)), ctx);
+                }
+            }
+        },
+    }
+}
+
+/// Jump anchor to cursor's record, then scroll so cursor.line lands at
+/// `target_screen_line`.
+fn snap_cursor_to_line(
+    anchor: &mut ViewportAnchor,
+    cursor: &CursorState,
+    ctx: &NavContext,
+    target_screen_line: usize,
+) {
+    anchor.apply(NavIntent::JumpToRecord(cursor.record), ctx);
+    // After jump: anchor is at (cursor.record, 0), so cursor sits at
+    // screen_line == cursor.line. Adjust to reach target_screen_line.
+    if cursor.line < target_screen_line {
+        let scroll = target_screen_line - cursor.line;
+        anchor.apply(NavIntent::Scroll(-(scroll as isize)), ctx);
+    } else if cursor.line > target_screen_line {
+        let scroll = cursor.line - target_screen_line;
+        anchor.apply(NavIntent::Scroll(scroll as isize), ctx);
     }
 }
 
@@ -296,42 +437,198 @@ mod tests {
     }
 
     #[test]
-    fn keep_cursor_visible_scrolls_down() {
-        let h = FakeHeights([(5, 1), (6, 1)].into());
+    fn moving_down_enforces_bottom_margin_only() {
+        // visible_height=50, margin=5. Cursor at screen line 46 (row 46).
+        // Moving down: bottom margin at 50-5-1=44, scroll down by 46-44=2.
+        let h: FakeHeights = FakeHeights((0..50).map(|i| (i, 1)).collect());
         let ctx = NavContext {
             heights: &h,
-            total_rows: 10,
-            visible_height: 5,
+            total_rows: 50,
+            visible_height: 50,
         };
         let mut anchor = ViewportAnchor::top();
-        anchor.apply(NavIntent::JumpToRecord(5), &ctx);
         let c = CursorState {
-            record: 6,
+            record: 46,
             line: 0,
             selected_col: None,
             visible: true,
         };
-        keep_cursor_visible(&mut anchor, &c, 5, &ctx);
-        assert_eq!(anchor.row(), 6);
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Down);
+        assert_eq!(anchor.row(), 2);
     }
 
     #[test]
-    fn keep_cursor_visible_noop_when_already_visible() {
-        let h = FakeHeights(HashMap::new());
+    fn moving_down_does_not_enforce_top_margin() {
+        // Cursor at screen line 0 (top of viewport). Moving down should NOT
+        // scroll up to create top margin — no backjumps.
+        let h: FakeHeights = FakeHeights((0..50).map(|i| (i, 1)).collect());
         let ctx = NavContext {
             heights: &h,
-            total_rows: 10,
+            total_rows: 50,
+            visible_height: 50,
+        };
+        let mut anchor = ViewportAnchor::top();
+        anchor.apply(NavIntent::JumpToRecord(10), &ctx);
+        let c = CursorState {
+            record: 10,
+            line: 0,
+            selected_col: None,
+            visible: true,
+        };
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Down);
+        assert_eq!(anchor.row(), 10); // unchanged — no backjump
+    }
+
+    #[test]
+    fn moving_up_enforces_top_margin_only() {
+        // visible_height=50, margin=5. Anchor at row 10, cursor at row 12.
+        // screen_line = 2, which is < margin(5). Moving up: scroll up by 3.
+        let h: FakeHeights = FakeHeights((0..50).map(|i| (i, 1)).collect());
+        let ctx = NavContext {
+            heights: &h,
+            total_rows: 50,
+            visible_height: 50,
+        };
+        let mut anchor = ViewportAnchor::top();
+        anchor.apply(NavIntent::JumpToRecord(10), &ctx);
+        let c = CursorState {
+            record: 12,
+            line: 0,
+            selected_col: None,
+            visible: true,
+        };
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Up);
+        assert_eq!(anchor.row(), 7);
+    }
+
+    #[test]
+    fn moving_up_does_not_enforce_bottom_margin() {
+        // Cursor at screen line 49 (last visible). Moving up should NOT
+        // scroll down to create bottom margin.
+        let h: FakeHeights = FakeHeights((0..50).map(|i| (i, 1)).collect());
+        let ctx = NavContext {
+            heights: &h,
+            total_rows: 50,
+            visible_height: 50,
+        };
+        let mut anchor = ViewportAnchor::top();
+        let c = CursorState {
+            record: 49,
+            line: 0,
+            selected_col: None,
+            visible: true,
+        };
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Up);
+        assert_eq!(anchor.row(), 0); // unchanged — no forward jump
+    }
+
+    #[test]
+    fn noop_within_margin() {
+        // Cursor at screen line 10, margin=5. Both directions: no scroll.
+        let h: FakeHeights = FakeHeights((0..50).map(|i| (i, 1)).collect());
+        let ctx = NavContext {
+            heights: &h,
+            total_rows: 50,
+            visible_height: 50,
+        };
+        let mut anchor = ViewportAnchor::top();
+        let c = CursorState {
+            record: 10,
+            line: 0,
+            selected_col: None,
+            visible: true,
+        };
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Down);
+        assert_eq!(anchor.row(), 0);
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Up);
+        assert_eq!(anchor.row(), 0);
+    }
+
+    #[test]
+    fn cursor_above_viewport_moving_up_snaps() {
+        // Anchor at row 20, cursor at row 5. Moving up: cursor is above
+        // viewport, snap so cursor sits at top margin (screen line 5).
+        let h: FakeHeights = FakeHeights((0..50).map(|i| (i, 1)).collect());
+        let ctx = NavContext {
+            heights: &h,
+            total_rows: 50,
+            visible_height: 50,
+        };
+        let mut anchor = ViewportAnchor::top();
+        anchor.apply(NavIntent::JumpToRecord(20), &ctx);
+        let c = CursorState {
+            record: 5,
+            line: 0,
+            selected_col: None,
+            visible: true,
+        };
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Up);
+        assert_eq!(anchor.row(), 0);
+    }
+
+    #[test]
+    fn cursor_above_viewport_moving_down_also_snaps() {
+        // Cursor at row 5, viewport scrolled to row 20 via Ctrl+j.
+        // Pressing j (dir=Down) — cursor is off-screen, so snap regardless
+        // of direction. No-backjump only applies on-screen.
+        let h: FakeHeights = FakeHeights((0..50).map(|i| (i, 1)).collect());
+        let ctx = NavContext {
+            heights: &h,
+            total_rows: 50,
+            visible_height: 50,
+        };
+        let mut anchor = ViewportAnchor::top();
+        anchor.apply(NavIntent::JumpToRecord(20), &ctx);
+        let c = CursorState {
+            record: 5,
+            line: 0,
+            selected_col: None,
+            visible: true,
+        };
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Down);
+        assert_eq!(anchor.row(), 0); // snapped back — cursor must be visible
+    }
+
+    #[test]
+    fn cursor_below_viewport_snaps() {
+        // 100 rows, visible_height=20, margin=2. Anchor at 0, cursor at row 25.
+        // screen_line=25 >= visible_height=20, so cursor is below viewport.
+        // Should snap to bottom_target = 20 - 2 - 1 = 17.
+        let h: FakeHeights = FakeHeights((0..100).map(|i| (i, 1)).collect());
+        let ctx = NavContext {
+            heights: &h,
+            total_rows: 100,
+            visible_height: 20,
+        };
+        let mut anchor = ViewportAnchor::top();
+        let c = CursorState {
+            record: 25,
+            line: 0,
+            selected_col: None,
+            visible: true,
+        };
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Down);
+        // cursor at row 25 should be at screen line 17, so anchor at row 8
+        assert_eq!(anchor.row(), 8);
+    }
+
+    #[test]
+    fn zero_margin_for_small_viewport() {
+        // visible_height=5, margin=min(10,0)=0. No margin enforcement.
+        let h = FakeHeights([(0, 1), (1, 1), (2, 1), (3, 1), (4, 1)].into());
+        let ctx = NavContext {
+            heights: &h,
+            total_rows: 5,
             visible_height: 5,
         };
         let mut anchor = ViewportAnchor::top();
-        anchor.apply(NavIntent::JumpToRecord(2), &ctx);
         let c = CursorState {
             record: 4,
             line: 0,
             selected_col: None,
             visible: true,
         };
-        keep_cursor_visible(&mut anchor, &c, 8, &ctx);
-        assert_eq!(anchor.row(), 2);
+        keep_cursor_visible(&mut anchor, &c, &ctx, CursorDir::Down);
+        assert_eq!(anchor.row(), 0);
     }
 }

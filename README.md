@@ -47,9 +47,9 @@ Format is detected from file content, not extension.
 
 ## Keys
 
-Vim-style. `j`/`k` scroll, `J`/`K` page, `g`/`G` jump between records, `q` quits.
+Vim-style. `j`/`k` move the cursor, `J`/`K` page, `h`/`l` select columns, `g`/`G` jump between records, `q` quits.
 
-**Cursor**: `Ctrl-j`/`Ctrl-k` move between records, `h`/`l` select columns.
+**Scrolling**: `Ctrl-j`/`Ctrl-k` scroll the viewport without moving the cursor. `Ctrl-d`/`Ctrl-u` for half-page.
 
 **Search**: `/` to search, `n`/`N` for next/prev match. Searches across parquet columns directly, then highlights matching lines.
 

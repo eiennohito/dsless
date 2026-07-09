@@ -1,2 +1,4 @@
 /target
 fixtures/*.parquet
+.claude/worktrees/
+.claude/memory/
