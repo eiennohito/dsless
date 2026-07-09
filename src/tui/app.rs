@@ -4,19 +4,19 @@ use std::thread;
 use anyhow::Result;
 use crossterm::event::{self, Event};
 use ratatui::prelude::*;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 use crate::cache::RowCache;
 use crate::input::{Action, InputHandler, Mode};
 use crate::layout::{Layout, RenderSpec};
-use crate::preview::SchemaPath;
+use crate::preview::{self, DataPath};
 use crate::search::SearchState;
 use crate::source::DataSource;
 use crate::tui::cursor::{CursorState, keep_cursor_visible, line_column_count};
 use crate::tui::draw::draw;
 use crate::tui::label::{LabelMatch, resolve_label};
 use crate::tui::preview::{
-    ActivePreview, FieldOverlay, PreviewPhase, PreviewState, find_line_for_path, resolve_line_path,
+    ActivePreview, FieldOverlay, PreviewPhase, PreviewState,
 };
 use crate::viewport::{
     NavContext, NavIntent, VERTICAL_MODE_LINES_PER_ROW_ESTIMATE, ViewportAnchor,
@@ -117,14 +117,11 @@ impl App {
         }
     }
 
-    fn move_cursor_to_path(&mut self, row: usize, path: &SchemaPath) {
+    fn move_cursor_to_node(&mut self, row: usize, node: crate::render::NodeRef) {
         self.cursor.visible = true;
         self.cursor.record = row;
-        if self.is_table {
-            self.cursor.selected_col = path.0.first().copied();
-            self.cursor.line = 0;
-        } else if let Some(rendered) = self.cache.get(row) {
-            self.cursor.line = find_line_for_path(&rendered, path).unwrap_or(0);
+        if let Some(rendered) = self.cache.get(row) {
+            self.cursor.line = rendered.line_for_node(node).unwrap_or(0);
             self.cursor.selected_col = None;
         }
         self.sync_cursor_visible();
@@ -209,20 +206,6 @@ impl App {
             WorkerResponse::SearchProgress(row) => {
                 if let Some(ref mut s) = self.search {
                     s.progress = Some(row);
-                }
-            }
-            WorkerResponse::TruncatedFields { row, fields } => {
-                if matches!(self.preview.phase, PreviewPhase::WaitingForFields { row: r } if r == row)
-                {
-                    self.preview.phase = if fields.is_empty() {
-                        self.input.set_mode(Mode::Normal);
-                        PreviewPhase::Message("no truncated fields".to_string())
-                    } else {
-                        PreviewPhase::Overlay {
-                            overlay: FieldOverlay { row, fields },
-                            label_buf: SmallVec::new(),
-                        }
-                    };
                 }
             }
             WorkerResponse::FieldRendered {
@@ -422,9 +405,18 @@ impl App {
 
             Action::ShowFieldNumbers => {
                 let target = self.anchor.row();
-                self.preview.phase = PreviewPhase::WaitingForFields { row: target };
-                self.worker_tx
-                    .send(WorkerRequest::ListTruncatedFields { row: target })?;
+                if let Some(rendered) = self.cache.get(target) {
+                    let fields = preview::expandable_fields(&rendered, &self.spec);
+                    if fields.is_empty() {
+                        self.preview.phase =
+                            PreviewPhase::Message("no expandable fields".to_string());
+                    } else {
+                        self.preview.phase = PreviewPhase::Overlay {
+                            overlay: FieldOverlay::new(target, fields, &rendered),
+                            label_buf: SmallVec::new(),
+                        };
+                    }
+                }
             }
             Action::OverlayInput(c) => {
                 // If we're in Preview with a fallback overlay, promote it
@@ -452,8 +444,15 @@ impl App {
                         LabelMatch::Resolved(idx) => {
                             if let Some(f) = overlay.fields.get(idx) {
                                 let overlay_row = overlay.row;
-                                let path = f.path.clone();
-                                self.move_cursor_to_path(overlay_row, &path);
+                                let node_ref = f.node;
+                                self.move_cursor_to_node(overlay_row, node_ref);
+                                let path = self
+                                    .cache
+                                    .get(overlay_row)
+                                    .map(|r| r.data_path(node_ref))
+                                    .unwrap_or_else(|| DataPath {
+                                        steps: SmallVec::new(),
+                                    });
                                 let fallback = match std::mem::replace(
                                     &mut self.preview.phase,
                                     PreviewPhase::Idle,
@@ -491,13 +490,11 @@ impl App {
                 }
             }
             Action::PreviewCursorCell => {
-                let path = if self.is_table {
-                    Some(SchemaPath(smallvec![self.cursor.selected_col.unwrap_or(0)]))
-                } else {
-                    self.cache
-                        .get(self.cursor.record)
-                        .and_then(|rendered| resolve_line_path(&rendered, self.cursor.line))
-                };
+                let path = self.cache.get(self.cursor.record).and_then(|rendered| {
+                    rendered
+                        .node_for_position(self.cursor.line, self.cursor.selected_col)
+                        .map(|n| rendered.data_path(n))
+                });
                 if let Some(path) = path {
                     self.preview.last_path = Some(path.clone());
                     self.preview.phase = PreviewPhase::WaitingForContent {

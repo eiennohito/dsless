@@ -106,8 +106,8 @@ pub(super) fn draw(
                         clt.push_str(line);
                         cursor_screen_y = screen_line;
                     }
-                    let label_prefix =
-                        overlay_here.and_then(|overlay| overlay_label_for_line(line, overlay));
+                    let label_prefix = overlay_here
+                        .and_then(|overlay| overlay_label_for_line(&rendered, li, overlay));
                     let mut styled =
                         style_line(line, row, &app_ref.search, is_cursor_line, selected_col);
                     if let Some(label) = label_prefix {

@@ -7,7 +7,7 @@ src/
   main.rs              CLI parsing, pipe mode output
   layout/              Two-layer display model: Layout + RenderSpec
   render.rs            Rendering methods on RenderSpec types
-  preview.rs           SchemaPath, truncation detection, full-field render
+  preview.rs           DataPath re-export, expandable-field query, full-field render
   source/              DataSource trait + format implementations
   cache.rs             SizedLruCache, RowCache
   search.rs            SearchState, record-scan search algorithm
@@ -100,15 +100,17 @@ Rendering methods are implemented on `RenderSpec` and `RenderSpecNode`:
 - `Vec<usize>` tracks line boundaries (byte offsets into the buffer)
 - `scratch: String` for temporary formatting (table cell width measurement)
 - Pre-computed guide string sliced by depth (no allocation per `guide()` call)
-- `field_spans: Vec<FieldSpan>` tags which schema field (vertical mode only) each line belongs to — see below
+- `nodes: Vec<DataNode>` — a node tree emitted during rendering (see below)
 
-`finish()` clones the buffer (and the field-span tags) into a `RenderedRow`. After warmup, rendering a row costs a small constant number of heap allocations regardless of complexity.
+`finish()` clones the buffer (and the node tree) into a `RenderedRow`. After warmup, rendering a row costs a small constant number of heap allocations regardless of complexity.
 
-### Line → field tagging (vertical mode)
+### DataNode tree
 
-Vertical-mode rendering calls `LineWriter::enter_field(depth, schema_idx)` immediately before writing each struct field's own line (`render_row`'s vertical branch, and `render_value`'s `Struct` branch for nested structs). Each call pushes a `FieldSpan { start_line, depth, schema_idx }` — a compact `(u16, u8, u16)` triple, not a full path, so the cost is one `Vec::push` per field rather than a string. Table mode never calls `enter_field`, so `field_spans` stays empty there at zero cost.
+Rendering emits `DataNode`s in DFS order via `LineWriter`'s `open_node`/`close_node` bracket API. Each node carries a byte range (start/end offsets into the rendered buffer), a depth, a kind (`RowHeader`, `Field { schema_idx }`, or `Instance { index }`), and a `Fidelity` (`Full`, `Constrained`, or `Summarized`). Fidelity is set by `mark_constrained` (value truncated to fit column width) and `mark_summarized` (structural elements like list items omitted entirely); `close_node` propagates child fidelity upward so a parent is at least as degraded as its worst child.
 
-`RenderedRow::field_path(line_idx)` reconstructs the full root-to-leaf schema path for a given line by scanning `field_spans` in rendering order and maintaining a stack keyed by `depth`: each span with `start_line <= line_idx` truncates the in-progress path to `depth - 1` entries and pushes its `schema_idx`, so by the time a span's `start_line` exceeds `line_idx` the path reflects exactly the chain of ancestor fields active at that line. This replaced `tui::preview::resolve_line_path`'s previous approach of parsing guide characters (`│ `) and field names back out of already-rendered text and re-matching them against the `RenderSpec` tree — the tags make that lookup exact and independent of display formatting.
+Both table mode and vertical mode emit nodes — table-mode rows get one `Instance` per row with `Field` children per column, vertical mode gets `Field` nodes at each struct level with `Instance` nodes inside lists. This uniformity means the same query API works for both modes.
+
+`RenderedRow::node_for_position(line_idx, selected_col)` resolves a cursor position to a `NodeRef` by finding the deepest node whose byte range contains the line's start byte, optionally refining into a column's `Field` child when `selected_col` is set. `data_path(node)` lazily reconstructs the full `DataPath` by walking ancestors backward from the target node — no path is stored per-node, keeping the per-node cost to 12 bytes.
 
 ### Display modes
 
@@ -155,11 +157,11 @@ Navigation positions the first matching line at 20% from the top of the viewport
 
 ## Preview
 
-The UI thread never touches Arrow data, so truncation detection and full-value rendering both happen worker-side and cross the channel as request/response pairs (`ListTruncatedFields`/`TruncatedFields`, `RenderFullField`/`FieldRendered` in `worker.rs`).
+The UI thread never touches Arrow data, so full-value rendering happens worker-side and crosses the channel as a request/response pair (`RenderFullField`/`FieldRendered` in `worker.rs`).
 
-`SchemaPath` (`preview.rs`) addresses a field in the schema tree: a single index in table mode (the column), or a chain of `schema_idx` values through nested structs in vertical mode. Lists and maps are not addressable by path — previewing one expands the whole field rather than a specific element, since a path describes schema shape, not a position within row data.
+Addressing uses `DataPath` / `PathStep` (`render.rs`, re-exported via `preview.rs`): `PathStep::Field(schema_idx)` for struct children, `PathStep::Index(element_idx)` for list elements and map entries. This makes lists and maps addressable — a path describes a position within row data, not just schema shape.
 
-`RenderSpec::find_truncated_fields` walks the row using the already-rendered widths (`write_cell_preview` vs `col_widths` in table mode; `max_display` vs actual string width in vertical mode, recursing into nested structs) to list which fields are currently cut off. Pressing `v` lists these as targets labeled with a base-20 alphanumeric code (`tui/label.rs`; digits then `qwertyuiop`, `1` as the zero/pad digit) rather than plain decimal numbers — this keeps the label width down to one character for up to 20 truncated fields, two for up to 400, and so on, and typing the label's characters (`Mode::VOverlay`) resolves incrementally so an invalid or complete prefix is detected after each keystroke (`resolve_label`).
+`expandable_fields` (`preview.rs`) queries the rendered `RenderedRow`'s node tree for fields whose `Fidelity` is `Constrained` or `Summarized`. This is synchronous — it reads nodes already present in the cached `RenderedRow`, with no worker round-trip. Pressing `v` lists these as targets labeled with a base-20 alphanumeric code (`tui/label.rs`; digits then `qwertyuiop`, `1` as the zero/pad digit) rather than plain decimal numbers — this keeps the label width down to one character for up to 20 truncated fields, two for up to 400, and so on, and typing the label's characters (`Mode::VOverlay`) resolves incrementally so an invalid or complete prefix is detected after each keystroke (`resolve_label`).
 
 `render_field_full` renders one field with no width limits, reusing the same recursive `RenderSpecNode::render_value` that renders normal rows, parameterized by `RenderMode` (`render.rs`). `RenderMode::Preview` changes two things relative to a normal row: scalar lists render one item per line instead of inline (there's a whole popup to spread out in), and a struct field's own children aren't preceded by the usual blank separator line (that blank line exists to separate a struct's children from the `"field: "` text on the line above it — a standalone preview has no such prefix at any depth, since the previewed field itself has no parent context in the popup). Because a preview must be untruncated at every depth, not just the target field, it first rebuilds the field's spec subtree with every string's `max_display` set to unlimited (`unlimit`) before rendering.
 

@@ -11,8 +11,6 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use dsless::layout;
 use dsless::render;
 use dsless::source;
-use dsless::source::DataSource;
-
 #[derive(Parser)]
 struct Args {
     path: PathBuf,

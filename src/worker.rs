@@ -2,7 +2,7 @@ use std::sync::{Arc, mpsc};
 
 use crate::cache::RowCache;
 use crate::layout::RenderSpec;
-use crate::preview::{self, SchemaPath, TruncatedField};
+use crate::preview::{self, DataPath};
 use crate::render::{self, LineWriter};
 use crate::search;
 use crate::source::DataSource;
@@ -19,14 +19,10 @@ pub enum WorkerRequest {
         scan_from: usize,
         limit: usize,
     },
-    /// List truncated fields for the `v` overlay.
-    ListTruncatedFields {
-        row: usize,
-    },
     /// Render one field's value with no width constraints, for the preview popup.
     RenderFullField {
         row: usize,
-        path: SchemaPath,
+        path: DataPath,
     },
     /// Terminal resized — adopt a new RenderSpec.
     UpdateSpec(Arc<RenderSpec>),
@@ -42,13 +38,9 @@ pub enum WorkerResponse {
         scanned_up_to: usize,
     },
     SearchProgress(usize),
-    TruncatedFields {
-        row: usize,
-        fields: Vec<TruncatedField>,
-    },
     FieldRendered {
         row: usize,
-        path: SchemaPath,
+        path: DataPath,
         name: String,
         content: String,
         line_count: usize,
@@ -161,9 +153,6 @@ fn handle_request(
         } => {
             do_search(source, spec, &query, scan_from, limit, writer, tx);
         }
-        WorkerRequest::ListTruncatedFields { row } => {
-            list_truncated_fields(source, spec, row, tx);
-        }
         WorkerRequest::RenderFullField { row, path } => {
             render_full_field(source, spec, writer, row, path, tx);
         }
@@ -174,32 +163,12 @@ fn handle_request(
     }
 }
 
-/// Truncation detection needs the raw Arrow row (not the cached rendered
-/// text), so it loads directly through the source rather than the cache.
-fn list_truncated_fields(
-    source: &mut Box<dyn DataSource>,
-    spec: &RenderSpec,
-    row: usize,
-    tx: &mpsc::Sender<WorkerResponse>,
-) {
-    if source.ensure_loaded(row).is_err() {
-        let _ = tx.send(WorkerResponse::TruncatedFields {
-            row,
-            fields: Vec::new(),
-        });
-        return;
-    }
-    let (batch, local_row) = source.get_row(row);
-    let fields = spec.find_truncated_fields(batch, local_row);
-    let _ = tx.send(WorkerResponse::TruncatedFields { row, fields });
-}
-
 fn render_full_field(
     source: &mut Box<dyn DataSource>,
     spec: &RenderSpec,
     writer: &mut LineWriter,
     row: usize,
-    path: SchemaPath,
+    path: DataPath,
     tx: &mpsc::Sender<WorkerResponse>,
 ) {
     let result = source.ensure_loaded(row).ok().and_then(|()| {

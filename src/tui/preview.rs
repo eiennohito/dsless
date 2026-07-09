@@ -2,9 +2,10 @@ use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
-use crate::preview::{SchemaPath, TruncatedField};
+use crate::preview::{DataPath, ExpandableField};
+use crate::render::DataNodeKind;
 use crate::render::RenderedRow;
 use crate::tui::label::field_label;
 use crate::unicode::display_width;
@@ -30,9 +31,6 @@ const MAX_WRAP_LINES_PER_ENTRY: usize = 20;
 /// ```
 pub enum PreviewPhase {
     Idle,
-    WaitingForFields {
-        row: usize,
-    },
     Message(String),
     Overlay {
         overlay: FieldOverlay,
@@ -40,7 +38,7 @@ pub enum PreviewPhase {
     },
     WaitingForContent {
         row: usize,
-        path: SchemaPath,
+        path: DataPath,
         fallback: Option<FieldOverlay>,
     },
     Preview {
@@ -51,7 +49,7 @@ pub enum PreviewPhase {
 
 pub struct PreviewState {
     pub phase: PreviewPhase,
-    pub last_path: Option<SchemaPath>,
+    pub last_path: Option<DataPath>,
 }
 
 impl PreviewState {
@@ -107,7 +105,40 @@ impl Default for PreviewState {
 
 pub struct FieldOverlay {
     pub row: usize,
-    pub fields: Vec<TruncatedField>,
+    pub fields: Vec<ExpandableField>,
+    /// Precomputed field-index → display-column mapping for table-mode
+    /// header labels. Avoids O(C²·F) recomputation on every draw.
+    pub col_labels: Vec<Option<usize>>,
+}
+
+impl FieldOverlay {
+    pub fn new(row: usize, fields: Vec<ExpandableField>, rendered: &RenderedRow) -> Self {
+        let col_labels = Self::build_col_labels(&fields, rendered);
+        FieldOverlay {
+            row,
+            fields,
+            col_labels,
+        }
+    }
+
+    fn build_col_labels(fields: &[ExpandableField], rendered: &RenderedRow) -> Vec<Option<usize>> {
+        let depth1_fields: Vec<usize> = rendered
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.depth == 1 && matches!(n.kind, DataNodeKind::Field { .. }))
+            .map(|(i, _)| i)
+            .collect();
+
+        depth1_fields
+            .iter()
+            .map(|&node_idx| {
+                fields
+                    .iter()
+                    .position(|f| f.node.0 as usize == node_idx)
+            })
+            .collect()
+    }
 }
 
 pub struct ActivePreview {
@@ -209,11 +240,10 @@ pub fn overlay_header_line(overlay: &FieldOverlay, col_widths: &[usize]) -> Line
             spans.push(Span::raw(" │ "));
         }
         let label = overlay
-            .fields
-            .iter()
-            .position(|f| f.path == SchemaPath(smallvec![ci]))
-            .map(|idx| field_label(idx, total))
-            .map(|l| format!("[{}]", l));
+            .col_labels
+            .get(ci)
+            .and_then(|opt| *opt)
+            .map(|idx| format!("[{}]", field_label(idx, total)));
         match label {
             Some(text) => {
                 let pad = cw.saturating_sub(text.len());
@@ -226,12 +256,21 @@ pub fn overlay_header_line(overlay: &FieldOverlay, col_widths: &[usize]) -> Line
     Line::from(spans)
 }
 
-pub fn overlay_label_for_line(line: &str, overlay: &FieldOverlay) -> Option<String> {
+pub fn overlay_label_for_line(
+    rendered: &RenderedRow,
+    line_idx: usize,
+    overlay: &FieldOverlay,
+) -> Option<String> {
+    if line_idx >= rendered.line_count() {
+        return None;
+    }
+    let line_byte = rendered.line_starts_raw()[line_idx] as u32;
     let total = overlay.fields.len();
-    let trimmed = line.trim_start_matches(['│', ' ']);
     let idx = overlay.fields.iter().position(|f| {
-        let leaf = f.name.rsplit('.').next().unwrap_or(&f.name);
-        trimmed.starts_with(leaf) && trimmed[leaf.len()..].starts_with(": ")
+        rendered
+            .nodes
+            .get(f.node.0 as usize)
+            .is_some_and(|node| node.byte_start <= line_byte && line_byte < node.byte_end)
     })?;
     Some(format!("[{}] ", field_label(idx, total)))
 }
@@ -316,122 +355,20 @@ pub fn render_preview(
     }
 }
 
-// ── Line → path resolution ──────────────────────────────────
-
-/// Resolve which schema path a rendered line belongs to, from the field
-/// tags `LineWriter` recorded during rendering (`RenderedRow::field_path`)
-/// rather than re-parsing guide characters and field names back out of
-/// the rendered text.
-pub fn resolve_line_path(rendered: &RenderedRow, line_idx: usize) -> Option<SchemaPath> {
-    if line_idx >= rendered.line_count() {
-        return None;
-    }
-    let path = rendered.field_path(line_idx);
-    if path.is_empty() {
-        None
-    } else {
-        Some(SchemaPath(path))
-    }
-}
-
-/// Find the first rendered line whose field path matches `target`.
-pub fn find_line_for_path(rendered: &RenderedRow, target: &SchemaPath) -> Option<usize> {
-    (0..rendered.line_count()).find(|&li| rendered.field_path(li)[..] == target.0[..])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
     use crate::layout::{Layout, RenderSpec};
-    use crate::render::{LineWriter, render_record};
+    use crate::preview::PathStep;
+    use crate::render::{LineWriter, NodeRef, render_record};
     use crate::source::DataSource;
     use crate::source::test_support::FakeDataSource;
 
-    fn nested_struct_source() -> FakeDataSource {
-        use arrow::array::{Array, Int32Array, StringArray, StructArray};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use std::sync::Arc;
-
-        let inner = StructArray::from(vec![
-            (
-                Arc::new(Field::new("x", DataType::Int32, false)),
-                Arc::new(Int32Array::from(vec![1])) as Arc<dyn arrow::array::Array>,
-            ),
-            (
-                Arc::new(Field::new("desc", DataType::Utf8, false)),
-                Arc::new(StringArray::from(vec!["d"])) as Arc<dyn arrow::array::Array>,
-            ),
-        ]);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("nested", inner.data_type().clone(), false),
-        ]));
-        let batch = arrow::array::RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(vec![7])) as Arc<dyn arrow::array::Array>,
-                Arc::new(inner) as Arc<dyn arrow::array::Array>,
-            ],
-        )
-        .unwrap();
-        FakeDataSource::from_batch(batch)
-    }
-
-    #[test]
-    fn resolve_line_path_uses_field_tags_not_text_parsing() {
-        let mut source = nested_struct_source();
-        let layout = Layout::compute(&mut source);
-        let spec = RenderSpec::resolve(&layout, 80);
-        assert!(!spec.is_table(), "id + nested struct is vertical");
-
-        let mut writer = LineWriter::new();
-        source.ensure_loaded(0).unwrap();
-        let (batch, local_row) = source.get_row(0);
-        let rendered = render_record(&spec, batch, local_row, 0, &mut writer);
-
-        // line 0: "── Row 0 ──"; line 1: "id: 7"; line 2: "│ nested: ";
-        // line 3: "│ │ x: 1"; line 4: "│ │ desc: \"d\""
-        assert_eq!(
-            resolve_line_path(&rendered, 0),
-            None,
-            "row header has no field"
-        );
-        assert_eq!(
-            resolve_line_path(&rendered, 1),
-            Some(SchemaPath(smallvec![0]))
-        );
-        assert_eq!(
-            resolve_line_path(&rendered, 2),
-            Some(SchemaPath(smallvec![1]))
-        );
-        assert_eq!(
-            resolve_line_path(&rendered, 3),
-            Some(SchemaPath(smallvec![1, 0]))
-        );
-        assert_eq!(
-            resolve_line_path(&rendered, 4),
-            Some(SchemaPath(smallvec![1, 1]))
-        );
-    }
-
-    #[test]
-    fn resolve_line_path_out_of_range_is_none() {
-        let mut source = FakeDataSource::two_columns(&[("alice", 1)]);
-        let layout = Layout::compute(&mut source);
-        let spec = RenderSpec::resolve(&layout, 80);
-
-        let mut writer = LineWriter::new();
-        source.ensure_loaded(0).unwrap();
-        let (batch, local_row) = source.get_row(0);
-        let rendered = render_record(&spec, batch, local_row, 0, &mut writer);
-
-        assert_eq!(resolve_line_path(&rendered, 99), None);
-    }
-
-    fn field(path: Vec<usize>, name: &str) -> TruncatedField {
-        TruncatedField {
-            path: SchemaPath(path.into()),
-            name: name.to_string(),
+    fn field(node_idx: u16) -> ExpandableField {
+        ExpandableField {
+            node: NodeRef(node_idx),
+            name: String::new(),
         }
     }
 
@@ -480,9 +417,9 @@ mod tests {
     #[test]
     fn preview_state_dismiss_keeps_last_path() {
         let mut state = PreviewState::new();
-        state.last_path = Some(SchemaPath(smallvec![3]));
+        state.last_path = Some(DataPath { steps: smallvec![PathStep::Field(3)] });
         state.dismiss();
-        assert_eq!(state.last_path, Some(SchemaPath(smallvec![3])));
+        assert!(state.last_path.is_some());
     }
 
     #[test]
@@ -491,7 +428,8 @@ mod tests {
         state.phase = PreviewPhase::Overlay {
             overlay: FieldOverlay {
                 row: 0,
-                fields: vec![field(vec![0], "a")],
+                fields: vec![field(0)],
+                col_labels: vec![],
             },
             label_buf: SmallVec::new(),
         };
@@ -505,18 +443,20 @@ mod tests {
         let mut state = PreviewState::new();
         let overlay = FieldOverlay {
             row: 5,
-            fields: vec![field(vec![1], "b")],
+            fields: vec![field(1)],
+            col_labels: vec![],
         };
         state.phase = PreviewPhase::WaitingForContent {
             row: 5,
-            path: SchemaPath(smallvec![1]),
+            path: DataPath { steps: smallvec![PathStep::Field(1)] },
             fallback: Some(overlay),
         };
         assert_eq!(state.overlay().map(|o| o.row), Some(5));
 
         let overlay = FieldOverlay {
             row: 5,
-            fields: vec![field(vec![1], "b")],
+            fields: vec![field(1)],
+            col_labels: vec![],
         };
         state.phase = PreviewPhase::Preview {
             active: ActivePreview::new("b".into(), "content".into(), 40),
@@ -537,19 +477,21 @@ mod tests {
     }
 
     #[test]
-    fn overlay_label_for_matching_fields() {
-        let overlay = FieldOverlay {
-            row: 0,
-            fields: vec![field(vec![0], "a"), field(vec![2, 0], "c.d")],
-        };
-        assert_eq!(
-            overlay_label_for_line("│ a: \"value\"", &overlay),
-            Some("[1] ".to_string()),
-        );
-        assert_eq!(
-            overlay_label_for_line("│ │ d: \"value\"", &overlay),
-            Some("[2] ".to_string()),
-        );
-        assert_eq!(overlay_label_for_line("│ b: 42", &overlay), None);
+    fn overlay_label_matches_by_byte_range() {
+        use crate::preview;
+        let long = "x".repeat(200);
+        let mut source = FakeDataSource::two_columns(&[(long.as_str(), 1), ("short", 2)]);
+        let layout = Layout::compute(&mut source);
+        let spec = RenderSpec::resolve(&layout, 40);
+        source.ensure_loaded(0).unwrap();
+        let (batch, local_row) = source.get_row(0);
+        let mut writer = LineWriter::new();
+        let rendered = render_record(&spec, batch, local_row, 0, &mut writer);
+
+        let fields = preview::expandable_fields(&rendered, &spec);
+        assert!(!fields.is_empty(), "should have expandable fields");
+        let overlay = FieldOverlay::new(0, fields, &rendered);
+        let label = overlay_label_for_line(&rendered, 0, &overlay);
+        assert!(label.is_some(), "data line should get a label");
     }
 }

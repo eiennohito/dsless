@@ -20,6 +20,43 @@ pub enum RenderMode {
     Preview,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum Fidelity {
+    Full = 0,
+    Constrained = 1,
+    Summarized = 2,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DataNodeKind {
+    RowHeader,
+    Field { schema_idx: u16 },
+    Instance { index: u16 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DataNode {
+    pub byte_start: u32,
+    pub byte_end: u32,
+    pub depth: u8,
+    pub kind: DataNodeKind,
+    pub fidelity: Fidelity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeRef(pub u16);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathStep {
+    Field(u16),
+    Index(u16),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataPath {
+    pub steps: SmallVec<[PathStep; 6]>,
+}
+
 pub fn render_record(
     spec: &RenderSpec,
     batch: &RecordBatch,
@@ -29,8 +66,10 @@ pub fn render_record(
 ) -> RenderedRow {
     writer.clear();
     if !spec.is_table() {
+        writer.open_node(0, DataNodeKind::RowHeader);
         let _ = write!(writer, "── Row {} ──", global_row);
         writer.newline();
+        writer.close_node();
     }
     spec.render_row(batch, local_row, writer);
     writer.finish()
@@ -99,8 +138,13 @@ impl RenderSpecNode {
                     }
                     let child = &children[di];
                     let col = batch.column(child.schema_idx);
+                    w.open_node(depth as u8, DataNodeKind::Field { schema_idx: child.schema_idx as u16 });
+                    if !is_scalar_spec(&child.spec.kind) {
+                        w.mark_summarized();
+                    }
                     child.spec.measure_cell(col.as_ref(), row, &mut w.scratch);
                     w.write_cell_padded(cw);
+                    w.close_node();
                 }
                 w.newline();
             }
@@ -111,12 +155,13 @@ impl RenderSpecNode {
             } => {
                 for child in children {
                     let col = batch.column(child.schema_idx);
-                    w.enter_field(depth as u8, child.schema_idx as u16);
+                    w.open_node(depth as u8, DataNodeKind::Field { schema_idx: child.schema_idx as u16 });
                     w.guide(depth);
                     let _ = write!(w, "{}: ", child.name);
                     child
                         .spec
                         .render_value(col.as_ref(), row, w, depth, RenderMode::Normal);
+                    w.close_node();
                 }
             }
             _ => unreachable!("root spec must be Struct"),
@@ -157,26 +202,26 @@ impl RenderSpecNode {
                 w.newline();
             }
             RenderSpecKind::Str { max_display } => {
+                if display_width(extract_str(array, row)) > *max_display {
+                    w.mark_constrained();
+                }
                 write_string_verbose(&mut w.buf, array, row, *max_display);
                 w.newline();
             }
             RenderSpecKind::Struct { children, .. } => {
                 let sa = array.as_any().downcast_ref::<StructArray>().unwrap();
-                // The blank line separates a struct's children from the
-                // "field: " text preceding it on the same line. A preview
-                // opens directly on the struct with no such prefix, so it
-                // skips straight to the children.
                 if mode == RenderMode::Normal {
                     w.newline();
                 }
                 for child in children {
                     let col = sa.column(child.schema_idx);
-                    w.enter_field((depth + 1) as u8, child.schema_idx as u16);
+                    w.open_node((depth + 1) as u8, DataNodeKind::Field { schema_idx: child.schema_idx as u16 });
                     w.guide(depth + 1);
                     let _ = write!(w, "{}: ", child.name);
                     child
                         .spec
                         .render_value(col.as_ref(), row, w, depth + 1, mode);
+                    w.close_node();
                 }
             }
             RenderSpecKind::List { element } => {
@@ -186,7 +231,6 @@ impl RenderSpecNode {
                     w.newline();
                     return;
                 }
-                // List<Struct> with table_mode: render as nested table
                 if let RenderSpecKind::Struct {
                     table_mode: true,
                     children: child_specs,
@@ -196,12 +240,9 @@ impl RenderSpecNode {
                 } = &element.kind
                 {
                     let sa = values.as_any().downcast_ref::<StructArray>().unwrap();
-                    render_nested_table(sa, start, end, child_specs, col_widths, row_prefix, w);
+                    render_nested_table(sa, start, end, child_specs, col_widths, row_prefix, w, depth);
                     return;
                 }
-                // Scalar list: inline in normal mode (fits in the surrounding
-                // row); one-per-line in preview mode (there's a whole popup
-                // to spread out in, and it reads better for long lists).
                 if mode == RenderMode::Normal && is_scalar_spec(&element.kind) {
                     w.buf.push('[');
                     for i in start..end {
@@ -216,9 +257,11 @@ impl RenderSpecNode {
                     let _ = write!(w, "({} items)", end - start);
                     w.newline();
                     for i in start..end {
+                        w.open_node((depth + 1) as u8, DataNodeKind::Instance { index: (i - start) as u16 });
                         w.guide(depth + 1);
                         let _ = write!(w, "[{}]: ", i - start);
                         element.render_value(values.as_ref(), i, w, depth + 1, mode);
+                        w.close_node();
                     }
                 }
             }
@@ -236,10 +279,12 @@ impl RenderSpecNode {
                 } else {
                     w.newline();
                     for i in start..end {
+                        w.open_node((depth + 1) as u8, DataNodeKind::Instance { index: (i - start) as u16 });
                         w.guide(depth + 1);
                         key.write_scalar_inline(&mut w.buf, keys.as_ref(), i);
                         w.buf.push_str(": ");
                         value.render_value(vals.as_ref(), i, w, depth + 1, mode);
+                        w.close_node();
                     }
                 }
             }
@@ -384,6 +429,7 @@ fn render_nested_table(
     col_widths: &[usize],
     row_prefix: &str,
     w: &mut LineWriter,
+    depth: usize,
 ) {
     let count = end - start;
     if count == 0 {
@@ -419,6 +465,7 @@ fn render_nested_table(
 
     // Data rows
     for row in start..end {
+        w.open_node((depth + 1) as u8, DataNodeKind::Instance { index: (row - start) as u16 });
         w.buf.push_str(row_prefix);
         for (di, &cw) in col_widths.iter().enumerate() {
             if di > 0 {
@@ -426,10 +473,16 @@ fn render_nested_table(
             }
             let child = &children[di];
             let col = sa.column(child.schema_idx);
+            w.open_node((depth + 2) as u8, DataNodeKind::Field { schema_idx: child.schema_idx as u16 });
+            if !is_scalar_spec(&child.spec.kind) {
+                w.mark_summarized();
+            }
             child.spec.measure_cell(col.as_ref(), row, &mut w.scratch);
             w.write_cell_padded(cw);
+            w.close_node();
         }
         w.newline();
+        w.close_node();
     }
 }
 
@@ -440,27 +493,20 @@ fn is_scalar_spec(kind: &RenderSpecKind) -> bool {
     )
 }
 
-/// Which field a run of rendered lines (vertical mode) belongs to. Lines
-/// from `start_line` up to the next span's `start_line` (or end of row)
-/// are that field's own line plus any of its own un-tagged content (e.g.
-/// a struct's blank separator line before its children get their own spans).
-#[derive(Clone, Copy)]
-struct FieldSpan {
-    start_line: u16,
-    depth: u8,
-    schema_idx: u16,
-}
-
 /// Immutable rendered output for one data row. Stored in cache.
 pub struct RenderedRow {
     buf: String,
     line_starts: Vec<usize>,
-    field_spans: Vec<FieldSpan>,
+    pub(crate) nodes: Vec<DataNode>,
 }
 
 impl RenderedRow {
     pub fn line_count(&self) -> usize {
         self.line_starts.len()
+    }
+
+    pub(crate) fn line_starts_raw(&self) -> &[usize] {
+        &self.line_starts
     }
 
     pub fn line(&self, idx: usize) -> &str {
@@ -480,27 +526,120 @@ impl RenderedRow {
     pub fn byte_size(&self) -> usize {
         self.buf.len()
             + self.line_starts.len() * std::mem::size_of::<usize>()
-            + self.field_spans.len() * std::mem::size_of::<FieldSpan>()
+            + self.nodes.len() * std::mem::size_of::<DataNode>()
             + std::mem::size_of::<Self>()
     }
 
-    /// Schema path (root to leaf) of the field that rendered `line_idx`,
-    /// replacing the old approach of parsing guide characters and field
-    /// names back out of the rendered text. Empty outside vertical mode,
-    /// or for lines (row header, struct's blank separator) that precede
-    /// any field's own content at that depth.
-    pub fn field_path(&self, line_idx: usize) -> SmallVec<[usize; 4]> {
-        let line_idx = line_idx as u16;
-        let mut path: SmallVec<[usize; 4]> = SmallVec::new();
-        for span in &self.field_spans {
-            if span.start_line > line_idx {
+    /// Find the deepest node at a cursor position.
+    ///
+    /// When `selected_col` is `None`, returns the deepest node whose byte
+    /// range contains the line start — an Instance for table rows, a Field
+    /// for vertical fields.
+    ///
+    /// When `selected_col` is `Some(col)`, and the deepest node is an
+    /// Instance (table row), descends to the `col`-th Field child within
+    /// that Instance. This unifies top-level table mode and nested tables
+    /// in vertical mode — both use the same "find node, optionally refine
+    /// to column" logic.
+    pub fn node_for_position(
+        &self,
+        line_idx: usize,
+        selected_col: Option<usize>,
+    ) -> Option<NodeRef> {
+        if line_idx >= self.line_count() {
+            return None;
+        }
+        let line_byte = self.line_starts[line_idx] as u32;
+        let mut best: Option<(usize, u8)> = None;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.byte_start <= line_byte && line_byte < node.byte_end {
+                match best {
+                    None => best = Some((i, node.depth)),
+                    Some((_, d)) if node.depth > d => best = Some((i, node.depth)),
+                    _ => {}
+                }
+            }
+        }
+        let (best_idx, _) = best?;
+        let best_node = &self.nodes[best_idx];
+
+        if let (Some(col), DataNodeKind::Instance { .. }) = (selected_col, best_node.kind) {
+            let child_depth = best_node.depth + 1;
+            let field_node = self.nodes[best_idx + 1..]
+                .iter()
+                .enumerate()
+                .take_while(|(_, n)| n.depth >= child_depth)
+                .filter(|(_, n)| {
+                    n.depth == child_depth && matches!(n.kind, DataNodeKind::Field { .. })
+                })
+                .nth(col)
+                .map(|(offset, _)| NodeRef((best_idx + 1 + offset) as u16));
+            field_node.or(Some(NodeRef(best_idx as u16)))
+        } else if let (Some(col), DataNodeKind::Field { .. }) = (selected_col, best_node.kind) {
+            // Top-level table mode: line resolves to a Field at depth 1,
+            // but selected_col picks a different Field sibling
+            if best_node.depth == 1 {
+                let field_node = self
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| {
+                        n.depth == 1 && matches!(n.kind, DataNodeKind::Field { .. })
+                    })
+                    .nth(col)
+                    .map(|(i, _)| NodeRef(i as u16));
+                field_node.or(Some(NodeRef(best_idx as u16)))
+            } else {
+                Some(NodeRef(best_idx as u16))
+            }
+        } else {
+            Some(NodeRef(best_idx as u16))
+        }
+    }
+
+    pub fn data_path(&self, node: NodeRef) -> DataPath {
+        let idx = node.0 as usize;
+        let mut steps: SmallVec<[PathStep; 6]> = SmallVec::new();
+
+        // Collect the target node's step
+        match self.nodes[idx].kind {
+            DataNodeKind::Field { schema_idx } => steps.push(PathStep::Field(schema_idx)),
+            DataNodeKind::Instance { index } => steps.push(PathStep::Index(index)),
+            DataNodeKind::RowHeader => return DataPath { steps },
+        }
+
+        // Walk backward to collect ancestor steps
+        let mut current_depth = self.nodes[idx].depth;
+        for j in (0..idx).rev() {
+            if current_depth <= 1 {
                 break;
             }
-            path.truncate(span.depth as usize - 1);
-            path.push(span.schema_idx as usize);
+            let ancestor = &self.nodes[j];
+            if ancestor.depth < current_depth {
+                match ancestor.kind {
+                    DataNodeKind::Field { schema_idx } => {
+                        steps.push(PathStep::Field(schema_idx));
+                    }
+                    DataNodeKind::Instance { index } => {
+                        steps.push(PathStep::Index(index));
+                    }
+                    DataNodeKind::RowHeader => break,
+                }
+                current_depth = ancestor.depth;
+            }
         }
-        path
+
+        steps.reverse();
+        DataPath { steps }
     }
+
+    pub fn line_for_node(&self, node: NodeRef) -> Option<usize> {
+        let byte = self.nodes[node.0 as usize].byte_start as usize;
+        self.line_starts
+            .iter()
+            .rposition(|&start| start <= byte)
+    }
+
 }
 
 pub struct LineIter<'a> {
@@ -541,7 +680,8 @@ pub struct LineWriter {
     pub(crate) buf: String,
     line_starts: Vec<usize>,
     pub(crate) scratch: String,
-    field_spans: Vec<FieldSpan>,
+    nodes: Vec<DataNode>,
+    node_stack: Vec<usize>,
 }
 
 impl LineWriter {
@@ -550,7 +690,8 @@ impl LineWriter {
             buf: String::new(),
             line_starts: vec![0],
             scratch: String::new(),
-            field_spans: Vec::new(),
+            nodes: Vec::new(),
+            node_stack: Vec::new(),
         }
     }
 
@@ -558,7 +699,8 @@ impl LineWriter {
         self.buf.clear();
         self.line_starts.clear();
         self.line_starts.push(0);
-        self.field_spans.clear();
+        self.nodes.clear();
+        self.node_stack.clear();
     }
 
     pub fn newline(&mut self) {
@@ -572,17 +714,45 @@ impl LineWriter {
         self.buf.push_str(&g[..byte_len]);
     }
 
-    /// Record that the line about to be written (vertical mode only) is
-    /// `schema_idx`'s field at tree depth `depth`, so `RenderedRow::field_path`
-    /// can answer "which field is this line?" without re-parsing guide
-    /// characters and field names out of the rendered text.
-    pub fn enter_field(&mut self, depth: u8, schema_idx: u16) {
-        let current_line = (self.line_starts.len() - 1) as u16;
-        self.field_spans.push(FieldSpan {
-            start_line: current_line,
+    pub(crate) fn open_node(&mut self, depth: u8, kind: DataNodeKind) {
+        if self.nodes.len() >= u16::MAX as usize {
+            return;
+        }
+        let idx = self.nodes.len();
+        self.nodes.push(DataNode {
+            byte_start: self.buf.len() as u32,
+            byte_end: 0,
             depth,
-            schema_idx,
+            kind,
+            fidelity: Fidelity::Full,
         });
+        self.node_stack.push(idx);
+    }
+
+    pub(crate) fn close_node(&mut self) {
+        if let Some(idx) = self.node_stack.pop() {
+            self.nodes[idx].byte_end = self.buf.len() as u32;
+            if let Some(&parent_idx) = self.node_stack.last() {
+                let child_fidelity = self.nodes[idx].fidelity;
+                if child_fidelity > self.nodes[parent_idx].fidelity {
+                    self.nodes[parent_idx].fidelity = child_fidelity;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn mark_constrained(&mut self) {
+        if let Some(&idx) = self.node_stack.last() {
+            if Fidelity::Constrained > self.nodes[idx].fidelity {
+                self.nodes[idx].fidelity = Fidelity::Constrained;
+            }
+        }
+    }
+
+    pub(crate) fn mark_summarized(&mut self) {
+        if let Some(&idx) = self.node_stack.last() {
+            self.nodes[idx].fidelity = Fidelity::Summarized;
+        }
     }
 
     pub fn finish(&self) -> RenderedRow {
@@ -593,13 +763,14 @@ impl LineWriter {
         RenderedRow {
             buf: self.buf.clone(),
             line_starts,
-            field_spans: self.field_spans.clone(),
+            nodes: self.nodes.clone(),
         }
     }
 
     fn write_cell_padded(&mut self, width: usize) {
         let vw = display_width(&self.scratch);
         if vw > width {
+            self.mark_constrained();
             let truncated = truncate_to_width(&self.scratch, width);
             let tw = display_width(&truncated);
             self.buf.push_str(&truncated);
@@ -885,80 +1056,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn field_path_empty_in_table_mode() {
-        let mut source = FakeDataSource::two_columns(&[("alice", 42)]);
-        let layout = Layout::compute(&mut source);
-        let spec = RenderSpec::resolve(&layout, 80);
-        assert!(spec.is_table());
-
-        let mut writer = LineWriter::new();
-        source.ensure_loaded(0).unwrap();
-        let (batch, local_row) = source.get_row(0);
-        let rendered = render_record(&spec, batch, local_row, 0, &mut writer);
-
-        assert!(rendered.field_path(0).is_empty());
-    }
-
-    fn nested_vertical_source() -> FakeDataSource {
-        use arrow::datatypes::{Field, Schema};
-
-        let inner = StructArray::from(vec![
-            (
-                Arc::new(Field::new("x", DataType::Int32, false)),
-                Arc::new(Int32Array::from(vec![1])) as Arc<dyn Array>,
-            ),
-            (
-                Arc::new(Field::new("desc", DataType::Utf8, false)),
-                Arc::new(StringArray::from(vec!["d"])) as Arc<dyn Array>,
-            ),
-        ]);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("nested", inner.data_type().clone(), false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(vec![7])) as Arc<dyn Array>,
-                Arc::new(inner) as Arc<dyn Array>,
-            ],
-        )
-        .unwrap();
-        FakeDataSource::from_batch(batch)
-    }
-
-    #[test]
-    fn field_path_tags_top_level_and_nested_struct_fields() {
-        let mut source = nested_vertical_source();
-        let layout = Layout::compute(&mut source);
-        let spec = RenderSpec::resolve(&layout, 80);
-        assert!(!spec.is_table());
-
-        let mut writer = LineWriter::new();
-        source.ensure_loaded(0).unwrap();
-        let (batch, local_row) = source.get_row(0);
-        let rendered = render_record(&spec, batch, local_row, 0, &mut writer);
-
-        let lines: Vec<&str> = rendered.lines().collect();
-        // line 0: "── Row 0 ──"; line 1: "id: 7"; line 2: "│ nested: ";
-        // line 3: "│ │ x: 1"; line 4: "│ │ desc: \"d\""
-        assert!(lines[1].contains("id: 7"), "got {:?}", lines);
-        assert!(lines[3].contains("x: 1"), "got {:?}", lines);
-        assert!(lines[4].contains("desc"), "got {:?}", lines);
-
-        assert!(rendered.field_path(0).is_empty(), "row header has no field");
-        assert_eq!(&rendered.field_path(1)[..], &[0], "id is field 0");
-        assert_eq!(
-            &rendered.field_path(2)[..],
-            &[1],
-            "nested's own line is field 1"
-        );
-        assert_eq!(&rendered.field_path(3)[..], &[1, 0], "nested.x is [1, 0]");
-        assert_eq!(
-            &rendered.field_path(4)[..],
-            &[1, 1],
-            "nested.desc is [1, 1]"
-        );
-    }
 }
