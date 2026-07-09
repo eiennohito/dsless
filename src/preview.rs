@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, RecordBatch, StructArray};
 use crate::layout::{RenderSpec, RenderSpecKind, RenderSpecNode};
+use crate::render::{DataNodeKind, Fidelity, LineWriter, RenderMode, RenderedRow, list_offsets};
 pub use crate::render::{DataPath, NodeRef, PathStep};
-use crate::render::{
-    DataNodeKind, Fidelity, LineWriter, RenderMode, RenderedRow, list_offsets,
-};
+use arrow::array::{Array, RecordBatch, StructArray};
 
 pub struct ExpandableField {
     pub node: NodeRef,
@@ -115,7 +113,13 @@ pub fn render_field_full(
         let _ = std::fmt::Write::write_str(writer, "null");
         writer.newline();
     } else {
-        unlimited.render_value(result.array.as_ref(), result.row, writer, 0, RenderMode::Preview);
+        unlimited.render_value(
+            result.array.as_ref(),
+            result.row,
+            writer,
+            0,
+            RenderMode::Preview,
+        );
     }
     let rendered = writer.finish();
     Some((result.name, rendered))
@@ -187,9 +191,7 @@ fn navigate_data_path(
                         array = values;
                     }
                     RenderSpecKind::Map { value, .. } => {
-                        let ma = array
-                            .as_any()
-                            .downcast_ref::<arrow::array::MapArray>()?;
+                        let ma = array.as_any().downcast_ref::<arrow::array::MapArray>()?;
                         let offsets = ma.offsets();
                         let start = offsets[row] as usize;
                         let end = offsets[row + 1] as usize;
@@ -258,10 +260,10 @@ fn unlimit_in_place(node: &mut RenderSpecNode) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smallvec::smallvec;
     use crate::layout::Layout;
     use crate::source::DataSource;
     use crate::source::test_support::FakeDataSource;
+    use smallvec::smallvec;
 
     fn field_path(indices: &[u16]) -> DataPath {
         DataPath {
@@ -279,14 +281,8 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) = render_field_full(
-            &spec,
-            batch,
-            local_row,
-            &field_path(&[0]),
-            &mut writer,
-        )
-        .unwrap();
+        let (name, rendered) =
+            render_field_full(&spec, batch, local_row, &field_path(&[0]), &mut writer).unwrap();
         assert_eq!(name, "name");
         let content: String = rendered.lines().collect::<Vec<_>>().join("\n");
         assert!(content.contains(&long), "full string should be untruncated");
@@ -301,13 +297,7 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let result = render_field_full(
-            &spec,
-            batch,
-            local_row,
-            &field_path(&[99]),
-            &mut writer,
-        );
+        let result = render_field_full(&spec, batch, local_row, &field_path(&[99]), &mut writer);
         assert!(result.is_none());
     }
 
@@ -378,14 +368,8 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) = render_field_full(
-            &spec,
-            batch,
-            local_row,
-            &field_path(&[1]),
-            &mut writer,
-        )
-        .unwrap();
+        let (name, rendered) =
+            render_field_full(&spec, batch, local_row, &field_path(&[1]), &mut writer).unwrap();
         assert_eq!(name, "nested");
         assert!(
             !rendered.line(0).trim().is_empty(),
@@ -409,14 +393,8 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) = render_field_full(
-            &spec,
-            batch,
-            local_row,
-            &field_path(&[1, 1]),
-            &mut writer,
-        )
-        .unwrap();
+        let (name, rendered) =
+            render_field_full(&spec, batch, local_row, &field_path(&[1, 1]), &mut writer).unwrap();
         assert_eq!(name, "nested.desc");
         let content: String = rendered.lines().collect::<Vec<_>>().join("\n");
         assert!(content.contains(&"z".repeat(300)));
@@ -457,14 +435,8 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) = render_field_full(
-            &spec,
-            batch,
-            local_row,
-            &field_path(&[0]),
-            &mut writer,
-        )
-        .unwrap();
+        let (name, rendered) =
+            render_field_full(&spec, batch, local_row, &field_path(&[0]), &mut writer).unwrap();
         assert_eq!(name, "nums");
 
         let lines: Vec<&str> = rendered.lines().collect();
@@ -513,14 +485,8 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) = render_field_full(
-            &spec,
-            batch,
-            local_row,
-            &field_path(&[0]),
-            &mut writer,
-        )
-        .unwrap();
+        let (name, rendered) =
+            render_field_full(&spec, batch, local_row, &field_path(&[0]), &mut writer).unwrap();
         assert_eq!(name, "counts");
 
         // Map (unlike Struct) always opens with a blank line, even in preview
@@ -572,14 +538,8 @@ mod tests {
         source.ensure_loaded(0).unwrap();
         let (batch, local_row) = source.get_row(0);
         let mut writer = LineWriter::new();
-        let (name, rendered) = render_field_full(
-            &spec,
-            batch,
-            local_row,
-            &field_path(&[0]),
-            &mut writer,
-        )
-        .unwrap();
+        let (name, rendered) =
+            render_field_full(&spec, batch, local_row, &field_path(&[0]), &mut writer).unwrap();
         assert_eq!(name, "outer");
 
         let lines: Vec<&str> = rendered.lines().collect();
@@ -650,7 +610,11 @@ mod tests {
             ),
         ]);
         let details_list = ListArray::new(
-            Arc::new(Field::new("element", detail_struct.data_type().clone(), true)),
+            Arc::new(Field::new(
+                "element",
+                detail_struct.data_type().clone(),
+                true,
+            )),
             OffsetBuffer::new(vec![0i32, 2].into()),
             Arc::new(detail_struct),
             None,
@@ -661,7 +625,11 @@ mod tests {
                 Arc::new(StringArray::from(vec!["t"])) as Arc<dyn Array>,
             ),
             (
-                Arc::new(Field::new("details", details_list.data_type().clone(), false)),
+                Arc::new(Field::new(
+                    "details",
+                    details_list.data_type().clone(),
+                    false,
+                )),
                 Arc::new(details_list) as Arc<dyn Array>,
             ),
         ]);
@@ -750,7 +718,11 @@ mod tests {
         assert!(spec.is_table());
 
         let fields = expandable_fields(&rendered, &spec);
-        assert!(fields.is_empty(), "got: {:?}", fields.iter().map(|f| &f.name).collect::<Vec<_>>());
+        assert!(
+            fields.is_empty(),
+            "got: {:?}",
+            fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -776,14 +748,8 @@ mod tests {
         let (batch, local_row) = source.get_row(0);
 
         let mut writer = LineWriter::new();
-        let (name, rendered) = render_field_full(
-            &spec,
-            batch,
-            local_row,
-            &field_path(&[1]),
-            &mut writer,
-        )
-        .unwrap();
+        let (name, rendered) =
+            render_field_full(&spec, batch, local_row, &field_path(&[1]), &mut writer).unwrap();
         assert_eq!(name, "items");
 
         let content: String = rendered.lines().collect::<Vec<_>>().join("\n");
@@ -811,14 +777,8 @@ mod tests {
         let (batch, local_row) = source.get_row(0);
 
         let mut writer = LineWriter::new();
-        let (name, rendered) = render_field_full(
-            &spec,
-            batch,
-            local_row,
-            &field_path(&[2, 1]),
-            &mut writer,
-        )
-        .unwrap();
+        let (name, rendered) =
+            render_field_full(&spec, batch, local_row, &field_path(&[2, 1]), &mut writer).unwrap();
         assert_eq!(name, "meta.details");
 
         let content: String = rendered.lines().collect::<Vec<_>>().join("\n");
@@ -845,8 +805,8 @@ mod tests {
             steps: smallvec![PathStep::Field(1), PathStep::Index(0)],
         };
         let mut writer = LineWriter::new();
-        let (name, rendered) = render_field_full(&spec, batch, local_row, &path, &mut writer)
-            .unwrap();
+        let (name, rendered) =
+            render_field_full(&spec, batch, local_row, &path, &mut writer).unwrap();
         assert_eq!(name, "items[0]");
 
         let content: String = rendered.lines().collect::<Vec<_>>().join("\n");

@@ -53,10 +53,7 @@ fn main() -> Result<()> {
             let tl = Instant::now();
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
             let schema: SchemaRef = builder.schema().clone();
-            let reader = builder
-                .with_row_groups(vec![0])
-                .with_limit(200)
-                .build()?;
+            let reader = builder.with_row_groups(vec![0]).with_limit(200).build()?;
             let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>()?;
             let batch = concat_batches(&schema, &batches)?;
             limited_rows = batch.num_rows();
@@ -67,9 +64,7 @@ fn main() -> Result<()> {
             let tf = Instant::now();
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
             let schema: SchemaRef = builder.schema().clone();
-            let reader = builder
-                .with_row_groups(vec![0])
-                .build()?;
+            let reader = builder.with_row_groups(vec![0]).build()?;
             let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>()?;
             let batch = concat_batches(&schema, &batches)?;
             full_rows = batch.num_rows();
@@ -114,17 +109,32 @@ fn main() -> Result<()> {
     eprintln!("=== dsless startup profile ({n} iterations, median) ===");
     eprintln!("  source::open          {:>10.2?}", median(&mut t_open));
     eprintln!("  Layout::compute       {:>10.2?}", median(&mut t_layout));
-    eprintln!("    1st ensure_loaded   {:>10.2?}  (full RG, current behavior)", t_first_ensure);
-    eprintln!("    compute (cached)    {:>10.2?}  (feed + resolve)", t_compute_cached);
+    eprintln!(
+        "    1st ensure_loaded   {:>10.2?}  (full RG, current behavior)",
+        t_first_ensure
+    );
+    eprintln!(
+        "    compute (cached)    {:>10.2?}  (feed + resolve)",
+        t_compute_cached
+    );
     eprintln!("  RenderSpec::resolve   {:>10.2?}", median(&mut t_resolve));
     eprintln!("  render 50 rows        {:>10.2?}", median(&mut t_render));
     eprintln!("  ────────────────────────────────");
     eprintln!("  total                 {:>10.2?}", median(&mut t_total));
     eprintln!();
     eprintln!("=== row group read comparison ===");
-    eprintln!("  with_limit(200)       {:>10.2?}  ({limited_rows} rows read)", t_limited_read);
-    eprintln!("  full row group        {:>10.2?}  ({full_rows} rows read)", t_full_read);
-    eprintln!("  speedup               {:>10.1}x", t_full_read.as_secs_f64() / t_limited_read.as_secs_f64());
+    eprintln!(
+        "  with_limit(200)       {:>10.2?}  ({limited_rows} rows read)",
+        t_limited_read
+    );
+    eprintln!(
+        "  full row group        {:>10.2?}  ({full_rows} rows read)",
+        t_full_read
+    );
+    eprintln!(
+        "  speedup               {:>10.1}x",
+        t_full_read.as_secs_f64() / t_limited_read.as_secs_f64()
+    );
 
     Ok(())
 }

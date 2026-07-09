@@ -132,11 +132,7 @@ impl FieldOverlay {
 
         depth1_fields
             .iter()
-            .map(|&node_idx| {
-                fields
-                    .iter()
-                    .position(|f| f.node.0 as usize == node_idx)
-            })
+            .map(|&node_idx| fields.iter().position(|f| f.node.0 as usize == node_idx))
             .collect()
     }
 }
@@ -358,12 +354,12 @@ pub fn render_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smallvec::smallvec;
     use crate::layout::{Layout, RenderSpec};
     use crate::preview::PathStep;
     use crate::render::{LineWriter, NodeRef, render_record};
     use crate::source::DataSource;
     use crate::source::test_support::FakeDataSource;
+    use smallvec::smallvec;
 
     fn field(node_idx: u16) -> ExpandableField {
         ExpandableField {
@@ -417,7 +413,9 @@ mod tests {
     #[test]
     fn preview_state_dismiss_keeps_last_path() {
         let mut state = PreviewState::new();
-        state.last_path = Some(DataPath { steps: smallvec![PathStep::Field(3)] });
+        state.last_path = Some(DataPath {
+            steps: smallvec![PathStep::Field(3)],
+        });
         state.dismiss();
         assert!(state.last_path.is_some());
     }
@@ -448,7 +446,9 @@ mod tests {
         };
         state.phase = PreviewPhase::WaitingForContent {
             row: 5,
-            path: DataPath { steps: smallvec![PathStep::Field(1)] },
+            path: DataPath {
+                steps: smallvec![PathStep::Field(1)],
+            },
             fallback: Some(overlay),
         };
         assert_eq!(state.overlay().map(|o| o.row), Some(5));
