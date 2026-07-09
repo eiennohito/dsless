@@ -32,18 +32,6 @@ impl RenderSpec {
             _ => None,
         }
     }
-
-    /// Display name of column `idx` in table mode, for status-bar cursor feedback.
-    pub fn column_name(&self, idx: usize) -> Option<&str> {
-        match &self.root.kind {
-            RenderSpecKind::Struct {
-                table_mode: true,
-                children,
-                ..
-            } => children.get(idx).map(|c| c.name.as_str()),
-            _ => None,
-        }
-    }
 }
 
 /// A node in the RenderSpec tree. Each node knows how to render its
@@ -493,9 +481,6 @@ mod tests {
         let spec = RenderSpec::resolve(&layout, 80);
 
         assert_eq!(spec.col_widths().map(<[usize]>::len), Some(2));
-        assert!(spec.column_name(0).is_some());
-        assert!(spec.column_name(1).is_some());
-        assert_eq!(spec.column_name(2), None, "out-of-range column has no name");
     }
 
     #[test]
@@ -549,7 +534,6 @@ mod tests {
         }
 
         assert_eq!(spec.col_widths(), None);
-        assert_eq!(spec.column_name(0), None);
     }
 
     #[test]

@@ -57,6 +57,19 @@ pub struct DataPath {
     pub steps: SmallVec<[PathStep; 6]>,
 }
 
+/// Column slice within a rendered line, identified from the DataNode tree.
+pub struct ColumnSlice {
+    pub start: usize,
+    pub end: usize,
+    pub node: NodeRef,
+}
+
+/// Table column layout for a rendered line, derived from the DataNode tree.
+/// Works for both top-level table rows and nested table rows inside tree mode.
+pub struct LineTableInfo {
+    pub columns: SmallVec<[ColumnSlice; 8]>,
+}
+
 pub fn render_record(
     spec: &RenderSpec,
     batch: &RecordBatch,
@@ -138,7 +151,12 @@ impl RenderSpecNode {
                     }
                     let child = &children[di];
                     let col = batch.column(child.schema_idx);
-                    w.open_node(depth as u8, DataNodeKind::Field { schema_idx: child.schema_idx as u16 });
+                    w.open_node(
+                        depth as u8,
+                        DataNodeKind::Field {
+                            schema_idx: child.schema_idx as u16,
+                        },
+                    );
                     if !is_scalar_spec(&child.spec.kind) {
                         w.mark_summarized();
                     }
@@ -155,7 +173,12 @@ impl RenderSpecNode {
             } => {
                 for child in children {
                     let col = batch.column(child.schema_idx);
-                    w.open_node(depth as u8, DataNodeKind::Field { schema_idx: child.schema_idx as u16 });
+                    w.open_node(
+                        depth as u8,
+                        DataNodeKind::Field {
+                            schema_idx: child.schema_idx as u16,
+                        },
+                    );
                     w.guide(depth);
                     let _ = write!(w, "{}: ", child.name);
                     child
@@ -215,7 +238,12 @@ impl RenderSpecNode {
                 }
                 for child in children {
                     let col = sa.column(child.schema_idx);
-                    w.open_node((depth + 1) as u8, DataNodeKind::Field { schema_idx: child.schema_idx as u16 });
+                    w.open_node(
+                        (depth + 1) as u8,
+                        DataNodeKind::Field {
+                            schema_idx: child.schema_idx as u16,
+                        },
+                    );
                     w.guide(depth + 1);
                     let _ = write!(w, "{}: ", child.name);
                     child
@@ -240,7 +268,16 @@ impl RenderSpecNode {
                 } = &element.kind
                 {
                     let sa = values.as_any().downcast_ref::<StructArray>().unwrap();
-                    render_nested_table(sa, start, end, child_specs, col_widths, row_prefix, w, depth);
+                    render_nested_table(
+                        sa,
+                        start,
+                        end,
+                        child_specs,
+                        col_widths,
+                        row_prefix,
+                        w,
+                        depth,
+                    );
                     return;
                 }
                 if mode == RenderMode::Normal && is_scalar_spec(&element.kind) {
@@ -257,7 +294,12 @@ impl RenderSpecNode {
                     let _ = write!(w, "({} items)", end - start);
                     w.newline();
                     for i in start..end {
-                        w.open_node((depth + 1) as u8, DataNodeKind::Instance { index: (i - start) as u16 });
+                        w.open_node(
+                            (depth + 1) as u8,
+                            DataNodeKind::Instance {
+                                index: (i - start) as u16,
+                            },
+                        );
                         w.guide(depth + 1);
                         let _ = write!(w, "[{}]: ", i - start);
                         element.render_value(values.as_ref(), i, w, depth + 1, mode);
@@ -279,7 +321,12 @@ impl RenderSpecNode {
                 } else {
                     w.newline();
                     for i in start..end {
-                        w.open_node((depth + 1) as u8, DataNodeKind::Instance { index: (i - start) as u16 });
+                        w.open_node(
+                            (depth + 1) as u8,
+                            DataNodeKind::Instance {
+                                index: (i - start) as u16,
+                            },
+                        );
                         w.guide(depth + 1);
                         key.write_scalar_inline(&mut w.buf, keys.as_ref(), i);
                         w.buf.push_str(": ");
@@ -465,7 +512,12 @@ fn render_nested_table(
 
     // Data rows
     for row in start..end {
-        w.open_node((depth + 1) as u8, DataNodeKind::Instance { index: (row - start) as u16 });
+        w.open_node(
+            (depth + 1) as u8,
+            DataNodeKind::Instance {
+                index: (row - start) as u16,
+            },
+        );
         w.buf.push_str(row_prefix);
         for (di, &cw) in col_widths.iter().enumerate() {
             if di > 0 {
@@ -473,7 +525,12 @@ fn render_nested_table(
             }
             let child = &children[di];
             let col = sa.column(child.schema_idx);
-            w.open_node((depth + 2) as u8, DataNodeKind::Field { schema_idx: child.schema_idx as u16 });
+            w.open_node(
+                (depth + 2) as u8,
+                DataNodeKind::Field {
+                    schema_idx: child.schema_idx as u16,
+                },
+            );
             if !is_scalar_spec(&child.spec.kind) {
                 w.mark_summarized();
             }
@@ -536,11 +593,9 @@ impl RenderedRow {
     /// range contains the line start — an Instance for table rows, a Field
     /// for vertical fields.
     ///
-    /// When `selected_col` is `Some(col)`, and the deepest node is an
-    /// Instance (table row), descends to the `col`-th Field child within
-    /// that Instance. This unifies top-level table mode and nested tables
-    /// in vertical mode — both use the same "find node, optionally refine
-    /// to column" logic.
+    /// When `selected_col` is `Some(col)`, delegates to `line_table_info`
+    /// for the col-th column's Field node. Falls back to the deepest node
+    /// if the line isn't a table row or the column is out of range.
     pub fn node_for_position(
         &self,
         line_idx: usize,
@@ -549,52 +604,15 @@ impl RenderedRow {
         if line_idx >= self.line_count() {
             return None;
         }
-        let line_byte = self.line_starts[line_idx] as u32;
-        let mut best: Option<(usize, u8)> = None;
-        for (i, node) in self.nodes.iter().enumerate() {
-            if node.byte_start <= line_byte && line_byte < node.byte_end {
-                match best {
-                    None => best = Some((i, node.depth)),
-                    Some((_, d)) if node.depth > d => best = Some((i, node.depth)),
-                    _ => {}
+        if let Some(col) = selected_col {
+            if let Some(info) = self.line_table_info(line_idx) {
+                if let Some(col_slice) = info.columns.get(col) {
+                    return Some(col_slice.node);
                 }
             }
         }
-        let (best_idx, _) = best?;
-        let best_node = &self.nodes[best_idx];
-
-        if let (Some(col), DataNodeKind::Instance { .. }) = (selected_col, best_node.kind) {
-            let child_depth = best_node.depth + 1;
-            let field_node = self.nodes[best_idx + 1..]
-                .iter()
-                .enumerate()
-                .take_while(|(_, n)| n.depth >= child_depth)
-                .filter(|(_, n)| {
-                    n.depth == child_depth && matches!(n.kind, DataNodeKind::Field { .. })
-                })
-                .nth(col)
-                .map(|(offset, _)| NodeRef((best_idx + 1 + offset) as u16));
-            field_node.or(Some(NodeRef(best_idx as u16)))
-        } else if let (Some(col), DataNodeKind::Field { .. }) = (selected_col, best_node.kind) {
-            // Top-level table mode: line resolves to a Field at depth 1,
-            // but selected_col picks a different Field sibling
-            if best_node.depth == 1 {
-                let field_node = self
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, n)| {
-                        n.depth == 1 && matches!(n.kind, DataNodeKind::Field { .. })
-                    })
-                    .nth(col)
-                    .map(|(i, _)| NodeRef(i as u16));
-                field_node.or(Some(NodeRef(best_idx as u16)))
-            } else {
-                Some(NodeRef(best_idx as u16))
-            }
-        } else {
-            Some(NodeRef(best_idx as u16))
-        }
+        let line_byte = self.line_starts[line_idx] as u32;
+        self.deepest_node_at(line_byte).map(|i| NodeRef(i as u16))
     }
 
     pub fn data_path(&self, node: NodeRef) -> DataPath {
@@ -635,11 +653,97 @@ impl RenderedRow {
 
     pub fn line_for_node(&self, node: NodeRef) -> Option<usize> {
         let byte = self.nodes[node.0 as usize].byte_start as usize;
-        self.line_starts
-            .iter()
-            .rposition(|&start| start <= byte)
+        self.line_starts.iter().rposition(|&start| start <= byte)
     }
 
+    /// Query the DataNode tree for table column info on the given line.
+    /// Returns Some for lines that are table data rows (top-level or nested),
+    /// None for non-table lines (field labels, headers, separators, etc.).
+    ///
+    /// Works for both top-level table rows (Fields at depth 1 on the same line)
+    /// and nested table rows (Field children of an Instance node). Uses the
+    /// node tree exclusively — no text pattern matching.
+    pub fn line_table_info(&self, line_idx: usize) -> Option<LineTableInfo> {
+        if line_idx >= self.line_count() {
+            return None;
+        }
+        let line_start = self.line_starts[line_idx];
+        let line_byte = line_start as u32;
+        let best_idx = self.deepest_node_at(line_byte)?;
+        let best_node = &self.nodes[best_idx];
+
+        match best_node.kind {
+            DataNodeKind::Instance { .. } => {
+                let child_depth = best_node.depth + 1;
+                let columns = self.field_columns(best_idx + 1, child_depth, line_start);
+                if columns.is_empty() {
+                    return None;
+                }
+                Some(LineTableInfo { columns })
+            }
+            DataNodeKind::Field { .. } if best_node.depth == 1 => {
+                let line_end = if line_idx + 1 < self.line_starts.len() {
+                    self.line_starts[line_idx + 1] - 1
+                } else {
+                    self.buf.len()
+                };
+                let columns: SmallVec<[ColumnSlice; 8]> = self
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| {
+                        n.depth == 1
+                            && matches!(n.kind, DataNodeKind::Field { .. })
+                            && (n.byte_start as usize) >= line_start
+                            && (n.byte_start as usize) < line_end
+                    })
+                    .map(|(i, n)| ColumnSlice {
+                        start: (n.byte_start as usize).saturating_sub(line_start),
+                        end: (n.byte_end as usize).saturating_sub(line_start),
+                        node: NodeRef(i as u16),
+                    })
+                    .collect();
+                if columns.len() < 2 {
+                    return None;
+                }
+                Some(LineTableInfo { columns })
+            }
+            _ => None,
+        }
+    }
+
+    fn deepest_node_at(&self, byte: u32) -> Option<usize> {
+        let mut best: Option<(usize, u8)> = None;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.byte_start <= byte && byte < node.byte_end {
+                match best {
+                    None => best = Some((i, node.depth)),
+                    Some((_, d)) if node.depth > d => best = Some((i, node.depth)),
+                    _ => {}
+                }
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    fn field_columns(
+        &self,
+        start_idx: usize,
+        child_depth: u8,
+        line_start: usize,
+    ) -> SmallVec<[ColumnSlice; 8]> {
+        self.nodes[start_idx..]
+            .iter()
+            .enumerate()
+            .take_while(|(_, n)| n.depth >= child_depth)
+            .filter(|(_, n)| n.depth == child_depth && matches!(n.kind, DataNodeKind::Field { .. }))
+            .map(|(offset, n)| ColumnSlice {
+                start: (n.byte_start as usize).saturating_sub(line_start),
+                end: (n.byte_end as usize).saturating_sub(line_start),
+                node: NodeRef((start_idx + offset) as u16),
+            })
+            .collect()
+    }
 }
 
 pub struct LineIter<'a> {
@@ -1055,5 +1159,4 @@ mod tests {
             "separator row should have crossing"
         );
     }
-
 }

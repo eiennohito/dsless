@@ -6,6 +6,7 @@ use ratatui::widgets::{
 use anyhow::Result;
 
 use crate::input::Mode;
+use crate::preview::data_path_name;
 use crate::tui::app::App;
 use crate::tui::help::render_help_popup;
 use crate::tui::preview::{
@@ -13,24 +14,17 @@ use crate::tui::preview::{
 };
 use crate::tui::style::{style_header_line, style_line};
 
-/// Render the current `App` state into the terminal frame.
-///
-/// Split out of `app.rs` (which owns state and input handling) purely to
-/// keep that file under the project's line-count guidance — this function
-/// is pure UI layout/styling and doesn't belong conceptually with the
-/// state machine in `handle_action`.
 pub(super) fn draw(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> Result<()> {
     app.draw_had_cache_miss = false;
-    app.cursor_line_text.clear();
 
     let app_ref = &*app;
     let mut cache_miss = false;
     let mut last_row = 0usize;
-    let mut clt = String::new();
     let mut cursor_screen_y: u16 = 0;
+    let mut cursor_col_name = String::new();
 
     terminal.draw(|frame| {
         let area = frame.area();
@@ -101,15 +95,33 @@ pub(super) fn draw(
                     } else {
                         None
                     };
+                    let table_info = if is_cursor_line || selected_col.is_some() {
+                        rendered.line_table_info(li)
+                    } else {
+                        None
+                    };
                     if is_cursor_line {
-                        clt.clear();
-                        clt.push_str(line);
                         cursor_screen_y = screen_line;
+                        if let (Some(col), Some(info)) = (app_ref.cursor.selected_col, &table_info)
+                        {
+                            if let Some(col_slice) = info.columns.get(col) {
+                                let path = rendered.data_path(col_slice.node);
+                                let full_name = data_path_name(&app_ref.spec.root, &path);
+                                let short_name = full_name.rsplit('.').next().unwrap_or(&full_name);
+                                cursor_col_name = format!(" | [col: {}]", short_name);
+                            }
+                        }
                     }
                     let label_prefix = overlay_here
                         .and_then(|overlay| overlay_label_for_line(&rendered, li, overlay));
-                    let mut styled =
-                        style_line(line, row, &app_ref.search, is_cursor_line, selected_col);
+                    let mut styled = style_line(
+                        line,
+                        row,
+                        &app_ref.search,
+                        is_cursor_line,
+                        selected_col,
+                        table_info.as_ref(),
+                    );
                     if let Some(label) = label_prefix {
                         styled.spans.insert(0, Span::styled(label, LABEL_STYLE));
                     }
@@ -166,21 +178,13 @@ pub(super) fn draw(
             } else {
                 String::new()
             };
-            let cursor_info = match app_ref
-                .cursor
-                .selected_col
-                .and_then(|c| app_ref.spec.column_name(c))
-            {
-                Some(name) => format!(" | [col: {}]", name),
-                None => String::new(),
-            };
             format!(
                 "{}Row {}/{} ({}){}{}",
                 count_str,
                 app_ref.cursor.record + 1,
                 app_ref.total_rows,
                 pct,
-                cursor_info,
+                cursor_col_name,
                 search_info,
             )
         };
@@ -208,6 +212,5 @@ pub(super) fn draw(
 
     app.draw_had_cache_miss = cache_miss;
     app.last_visible_row = last_row;
-    app.cursor_line_text = clt;
     Ok(())
 }

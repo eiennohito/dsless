@@ -12,7 +12,7 @@ use crate::layout::{Layout, RenderSpec};
 use crate::preview::{self, DataPath};
 use crate::search::SearchState;
 use crate::source::DataSource;
-use crate::tui::cursor::{CursorDir, CursorState, keep_cursor_visible, line_column_count};
+use crate::tui::cursor::{CursorDir, CursorState, keep_cursor_visible};
 use crate::tui::draw::draw;
 use crate::tui::label::{LabelMatch, resolve_label};
 use crate::tui::preview::{ActivePreview, FieldOverlay, PreviewPhase, PreviewState};
@@ -79,13 +79,6 @@ pub(super) struct App {
     pub(super) preview: PreviewState,
     pub(super) last_visible_row: usize,
     pub(super) draw_had_cache_miss: bool,
-    /// Text of the line the cursor is currently on, captured by `draw()`.
-    /// `handle_action` reads this (for `CellLeft`/`CellRight` column counting)
-    /// without re-deriving it from the cache, so it's only valid for the
-    /// frame that was just drawn — draw() must run at least once before
-    /// any action that reads this, which the main loop guarantees by
-    /// calling `draw` right after constructing `App` and after every action.
-    pub(super) cursor_line_text: String,
 
     pub(super) cache: Arc<RowCache>,
     pub(super) spec: Arc<RenderSpec>,
@@ -134,18 +127,20 @@ impl App {
         keep_cursor_visible(&mut self.anchor, &self.cursor, &ctx, dir);
     }
 
-    /// Number of columns on the cursor's current line, for `CellLeft`/`CellRight`.
-    /// Top-level table mode already knows the column count from the spec
-    /// (`col_widths`), so it skips text parsing. Vertical mode's cursor line
-    /// might be a nested table row instead, whose width isn't in the
-    /// top-level spec — that case still falls back to counting separators
-    /// in the rendered text.
-    fn current_line_column_count(&self) -> usize {
-        if self.is_table {
-            self.spec.col_widths().map_or(0, <[usize]>::len)
-        } else {
-            line_column_count(&self.cursor_line_text)
-        }
+    /// Number of table columns on the cursor's current line, from the
+    /// DataNode tree. Works for both top-level and nested table rows.
+    fn cursor_column_count(&self) -> usize {
+        self.cache
+            .get(self.cursor.record)
+            .and_then(|r| r.line_table_info(self.cursor.line))
+            .map_or(0, |info| info.columns.len())
+    }
+
+    /// Clamp or clear the cursor's selected_col based on the current line's
+    /// actual table structure. Called after every cursor move.
+    fn clamp_cursor_column(&mut self) {
+        let col_count = self.cursor_column_count();
+        self.cursor.clamp_selected_col(col_count);
     }
 
     /// Move the viewport and cursor onto a search match and make sure its
@@ -311,6 +306,7 @@ impl App {
                 {
                     self.sync_cursor_visible(CursorDir::Down);
                 }
+                self.clamp_cursor_column();
             }
             Action::CursorRecordPrev | Action::CursorPageUp => {
                 self.dismiss_preview();
@@ -331,15 +327,16 @@ impl App {
                 {
                     self.sync_cursor_visible(CursorDir::Up);
                 }
+                self.clamp_cursor_column();
             }
             Action::CellLeft => {
                 self.dismiss_preview();
-                let cols = self.current_line_column_count();
+                let cols = self.cursor_column_count();
                 self.cursor.move_left(cols);
             }
             Action::CellRight => {
                 self.dismiss_preview();
-                let cols = self.current_line_column_count();
+                let cols = self.cursor_column_count();
                 self.cursor.move_right(cols);
             }
 
@@ -606,7 +603,6 @@ fn run_app(
         preview: PreviewState::new(),
         last_visible_row: 0,
         draw_had_cache_miss: false,
-        cursor_line_text: String::new(),
         cache,
         spec,
         schema_header,
@@ -629,8 +625,10 @@ fn run_app(
             AppEvent::Worker(resp) => {
                 app.handle_worker_response(resp)?;
             }
-            AppEvent::Term(Event::Resize(w, _h)) => {
+            AppEvent::Term(Event::Resize(w, h)) => {
                 let new_width = w as usize;
+                let new_height = h.saturating_sub(3) as usize;
+                app.visible_height = new_height;
                 if new_width != app.terminal_width {
                     app.terminal_width = new_width;
                     app.spec = Arc::new(RenderSpec::resolve(&layout, new_width));

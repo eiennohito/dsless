@@ -1,4 +1,3 @@
-use crate::render::COLUMN_SEPARATOR;
 use crate::viewport::{NavContext, NavIntent, RowHeightProvider, ViewportAnchor};
 
 /// Selects a single screen line (and optionally a cell within it).
@@ -33,9 +32,10 @@ impl CursorState {
 
     /// Move cursor down one line. Crosses record boundaries.
     /// Returns true if the cursor actually moved (for viewport sync).
+    /// Does NOT clear selected_col — caller must clamp via
+    /// `clamp_selected_col` after the move using the new line's table info.
     pub fn move_down(&mut self, heights: &dyn RowHeightProvider, total_rows: usize) -> bool {
         self.visible = true;
-        self.selected_col = None;
         if let Some(height) = heights.line_count(self.record) {
             if self.line + 1 < height {
                 self.line += 1;
@@ -55,9 +55,9 @@ impl CursorState {
     }
 
     /// Move cursor up one line. Crosses record boundaries.
+    /// Does NOT clear selected_col — caller must clamp after the move.
     pub fn move_up(&mut self, heights: &dyn RowHeightProvider) -> bool {
         self.visible = true;
-        self.selected_col = None;
         if self.line > 0 {
             self.line -= 1;
             return true;
@@ -81,17 +81,21 @@ impl CursorState {
     }
 
     /// Move column cursor left within a table row.
-    /// `line_col_count` is the number of columns on the current line
-    /// (detected from rendered text, not the schema).
+    /// At column 0, exits cell selection back to whole-row mode.
     pub fn move_left(&mut self, line_col_count: usize) {
         if line_col_count < 2 {
             return;
         }
         self.visible = true;
-        self.selected_col = Some(self.selected_col.map_or(0, |c| c.saturating_sub(1)));
+        self.selected_col = match self.selected_col {
+            Some(0) => None,
+            Some(c) => Some(c - 1),
+            None => None,
+        };
     }
 
     /// Move column cursor right within a table row.
+    /// From whole-row mode (None), enters cell selection at column 0.
     pub fn move_right(&mut self, line_col_count: usize) {
         if line_col_count < 2 {
             return;
@@ -165,6 +169,21 @@ impl CursorState {
         moved
     }
 
+    /// Clamp selected_col to the actual column count on the current line.
+    /// Called after every cursor move to preserve column selection within
+    /// tables and clear it on non-table lines.
+    pub fn clamp_selected_col(&mut self, column_count: usize) {
+        match self.selected_col {
+            Some(col) if column_count >= 2 => {
+                self.selected_col = Some(col.min(column_count - 1));
+            }
+            Some(_) => {
+                self.selected_col = None;
+            }
+            None => {}
+        }
+    }
+
     /// Check if the cursor is on this (row, line_index) pair.
     pub fn is_on(&self, row: usize, line_index: usize) -> bool {
         self.visible && self.record == row && self.line == line_index
@@ -175,15 +194,6 @@ impl Default for CursorState {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Count columns in a rendered line by counting ` │ ` separators.
-/// Works for top-level and nested table rows alike.
-pub fn line_column_count(line: &str) -> usize {
-    if !line.contains(COLUMN_SEPARATOR) {
-        return 0;
-    }
-    line.matches(COLUMN_SEPARATOR).count() + 1
 }
 
 /// Compute the cursor's screen-line distance from the viewport top.
@@ -384,6 +394,7 @@ mod tests {
     #[test]
     fn move_left_right_on_table_line() {
         let mut c = CursorState::new();
+        // l from None enters cell mode at col 0
         c.move_right(3);
         assert_eq!(c.selected_col, Some(0));
         assert!(c.visible);
@@ -392,9 +403,17 @@ mod tests {
         c.move_right(3);
         assert_eq!(c.selected_col, Some(2));
         c.move_right(3);
-        assert_eq!(c.selected_col, Some(2)); // clamped
+        assert_eq!(c.selected_col, Some(2)); // clamped at last col
         c.move_left(3);
         assert_eq!(c.selected_col, Some(1));
+        c.move_left(3);
+        assert_eq!(c.selected_col, Some(0));
+        // h at col 0 exits to row selection
+        c.move_left(3);
+        assert_eq!(c.selected_col, None);
+        // h from None is no-op
+        c.move_left(3);
+        assert_eq!(c.selected_col, None);
     }
 
     #[test]
@@ -407,11 +426,55 @@ mod tests {
     }
 
     #[test]
-    fn line_column_count_detects_separators() {
-        assert_eq!(line_column_count("alice │ 42"), 2);
-        assert_eq!(line_column_count("a │ b │ c"), 3);
-        assert_eq!(line_column_count("no columns here"), 0);
-        assert_eq!(line_column_count("│ not a separator"), 0); // no spaces around │
+    fn move_down_preserves_selected_col() {
+        let h = FakeHeights([(0, 5)].into());
+        let mut c = CursorState::new();
+        c.visible = true;
+        c.selected_col = Some(2);
+        assert!(c.move_down(&h, 5));
+        assert_eq!(c.selected_col, Some(2));
+    }
+
+    #[test]
+    fn move_up_preserves_selected_col() {
+        let h = FakeHeights([(0, 5)].into());
+        let mut c = CursorState::new();
+        c.visible = true;
+        c.line = 3;
+        c.selected_col = Some(1);
+        assert!(c.move_up(&h));
+        assert_eq!(c.selected_col, Some(1));
+    }
+
+    #[test]
+    fn clamp_selected_col_within_table() {
+        let mut c = CursorState::new();
+        c.selected_col = Some(5);
+        c.clamp_selected_col(3);
+        assert_eq!(c.selected_col, Some(2));
+    }
+
+    #[test]
+    fn clamp_selected_col_clears_on_non_table() {
+        let mut c = CursorState::new();
+        c.selected_col = Some(2);
+        c.clamp_selected_col(0);
+        assert_eq!(c.selected_col, None);
+    }
+
+    #[test]
+    fn clamp_selected_col_clears_on_single_column() {
+        let mut c = CursorState::new();
+        c.selected_col = Some(0);
+        c.clamp_selected_col(1);
+        assert_eq!(c.selected_col, None);
+    }
+
+    #[test]
+    fn clamp_selected_col_noop_when_none() {
+        let mut c = CursorState::new();
+        c.clamp_selected_col(5);
+        assert_eq!(c.selected_col, None);
     }
 
     #[test]
