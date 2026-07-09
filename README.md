@@ -47,7 +47,7 @@ Format is detected from file content, not extension.
 
 ## Keys
 
-Vim-style. `j`/`k` move the cursor, `J`/`K` page, `h`/`l` select columns, `g`/`G` jump between records, `q` quits.
+Vim-style. `j`/`k` (or arrows) move the cursor, `J`/`K` page, `h`/`l` (or arrows) select columns, `g`/`G` jump between records, `q` quits.
 
 **Scrolling**: `Ctrl-j`/`Ctrl-k` scroll the viewport without moving the cursor. `Ctrl-d`/`Ctrl-u` for half-page.
 

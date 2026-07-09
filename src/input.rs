@@ -227,6 +227,8 @@ impl InputHandler {
             KeyCode::Char('u') if ctrl => Action::ScrollHalfPage(-1),
             KeyCode::Char('h') if ctrl => Action::CellLeft,
             KeyCode::Char('l') if ctrl => Action::CellRight,
+            KeyCode::Left if ctrl => Action::CellLeft,
+            KeyCode::Right if ctrl => Action::CellRight,
             KeyCode::Char('j') if ctrl => Action::ScrollLines(1),
             KeyCode::Char('k') if ctrl => Action::ScrollLines(-1),
 
@@ -237,8 +239,8 @@ impl InputHandler {
 
             // --- Cell cursor ---
             KeyCode::Char(' ') => Action::PreviewCursorCell,
-            KeyCode::Char('h') => Action::CellLeft,
-            KeyCode::Char('l') => Action::CellRight,
+            KeyCode::Char('h') | KeyCode::Left => Action::CellLeft,
+            KeyCode::Char('l') | KeyCode::Right => Action::CellRight,
 
             // --- Record navigation ---
             KeyCode::Char('g') => match count {
