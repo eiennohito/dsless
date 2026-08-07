@@ -130,6 +130,16 @@ impl App {
         keep_cursor_visible(&mut self.anchor, &self.cursor, &ctx, dir);
     }
 
+    /// Wrap a cursor-moving operation: dismiss preview, snapshot column
+    /// state before the move, then resolve column selection after.
+    fn navigate(&mut self, f: impl FnOnce(&mut Self)) {
+        self.dismiss_preview();
+        let old_record = self.cursor.record;
+        let old_path = self.cursor_path();
+        f(self);
+        self.resolve_cursor_column(old_record, old_path);
+    }
+
     /// Number of table columns on the cursor's current line, from the
     /// DataNode tree. Works for both top-level and nested table rows.
     fn cursor_column_count(&self) -> usize {
@@ -139,11 +149,52 @@ impl App {
             .map_or(0, |info| info.columns.len())
     }
 
-    /// Clamp or clear the cursor's selected_col based on the current line's
-    /// actual table structure. Called after every cursor move.
-    fn clamp_cursor_column(&mut self) {
-        let col_count = self.cursor_column_count();
-        self.cursor.clamp_selected_col(col_count);
+    /// DataPath for the selected cell, or None if no column is selected.
+    /// Thin guard over `cursor_cell_path` — used to snapshot column state
+    /// before a navigation move.
+    fn cursor_path(&self) -> Option<DataPath> {
+        self.cursor.selected_col?;
+        self.cursor_cell_path()
+    }
+
+    /// Resolve the cursor's column selection after a move.
+    ///
+    /// - Table mode: clamp index (same schema on every row, never clear).
+    /// - Tree mode, same record: clamp index to new line's column count.
+    /// - Tree mode, record changed: match by path skeleton on the landing
+    ///   line; clear if no match.
+    fn resolve_cursor_column(&mut self, old_record: usize, old_path: Option<DataPath>) {
+        if !self.cache.contains(self.cursor.record) {
+            // Cache miss — preserve current selection, will resolve on next render.
+            return;
+        }
+
+        if self.is_table {
+            // Table mode: same columns on every row, just clamp.
+            let col_count = self.cursor_column_count();
+            self.cursor.clamp_selected_col_keep(col_count);
+            return;
+        }
+
+        // Tree mode
+        if self.cursor.record == old_record {
+            // Same record, different line — clamp index
+            let col_count = self.cursor_column_count();
+            self.cursor.clamp_selected_col(col_count);
+            return;
+        }
+
+        // Record changed — try path skeleton matching
+        if let Some(ref old_path) = old_path
+            && let Some(rendered) = self.cache.get(self.cursor.record)
+        {
+            let skeleton = old_path.skeleton();
+            if let Some(col) = rendered.find_column_by_skeleton(self.cursor.line, &skeleton) {
+                self.cursor.selected_col = Some(col);
+                return;
+            }
+        }
+        self.cursor.selected_col = None;
     }
 
     fn cursor_cell_path(&self) -> Option<DataPath> {
@@ -158,11 +209,12 @@ impl App {
     /// row is rendered. Shared by the first-batch jump in
     /// `handle_worker_response` and by `SearchNext`/`SearchPrev`.
     fn jump_to_search_match(&mut self, row: usize, match_line: usize) -> Result<()> {
-        self.apply_nav(NavIntent::JumpToMatch { row, match_line });
-        self.cursor.record = row;
-        self.cursor.line = match_line;
-        self.cursor.selected_col = None;
-        self.cursor.visible = true;
+        self.navigate(|s| {
+            s.apply_nav(NavIntent::JumpToMatch { row, match_line });
+            s.cursor.record = row;
+            s.cursor.line = match_line;
+            s.cursor.visible = true;
+        });
         self.send_render_range()
     }
 
@@ -282,69 +334,73 @@ impl App {
             }
 
             Action::PrevRecord => {
-                self.dismiss_preview();
-                self.apply_nav(NavIntent::PrevRecordBoundary);
-                self.cursor.jump_to_record(self.anchor.row());
+                self.navigate(|s| {
+                    s.apply_nav(NavIntent::PrevRecordBoundary);
+                    s.cursor.jump_to_record(s.anchor.row());
+                });
             }
             Action::NextRecord => {
-                self.dismiss_preview();
-                self.apply_nav(NavIntent::NextRecordBoundary);
-                self.cursor.jump_to_record(self.anchor.row());
+                self.navigate(|s| {
+                    s.apply_nav(NavIntent::NextRecordBoundary);
+                    s.cursor.jump_to_record(s.anchor.row());
+                });
             }
             Action::JumpToRecord(target) => {
-                self.dismiss_preview();
-                self.apply_nav(NavIntent::JumpToRecord(target));
-                self.cursor.jump_to_record(self.anchor.row());
+                self.navigate(|s| {
+                    s.apply_nav(NavIntent::JumpToRecord(target));
+                    s.cursor.jump_to_record(s.anchor.row());
+                });
             }
             Action::JumpPercent(n) => {
-                self.dismiss_preview();
-                let pct = n.min(100);
-                let target = if self.total_rows == 0 {
-                    0
-                } else {
-                    (self.total_rows.saturating_sub(1) * pct) / 100
-                };
-                self.apply_nav(NavIntent::JumpToRecord(target));
-                self.cursor.jump_to_record(self.anchor.row());
+                self.navigate(|s| {
+                    let pct = n.min(100);
+                    let target = if s.total_rows == 0 {
+                        0
+                    } else {
+                        (s.total_rows.saturating_sub(1) * pct) / 100
+                    };
+                    s.apply_nav(NavIntent::JumpToRecord(target));
+                    s.cursor.jump_to_record(s.anchor.row());
+                });
             }
 
             Action::CursorRecordNext | Action::CursorPageDown => {
-                self.dismiss_preview();
-                let count = if action == Action::CursorPageDown {
-                    self.visible_height
-                } else {
-                    1
-                };
-                if !self.cursor.visible {
-                    self.cursor.place_at_first_visible(&self.anchor);
-                } else if self
-                    .cursor
-                    .step(CursorDir::Down, count, &*self.cache, self.total_rows)
-                {
-                    self.sync_cursor_visible(CursorDir::Down);
-                }
-                self.clamp_cursor_column();
+                self.navigate(|s| {
+                    let count = if action == Action::CursorPageDown {
+                        s.visible_height
+                    } else {
+                        1
+                    };
+                    if !s.cursor.visible {
+                        s.cursor.place_at_first_visible(&s.anchor);
+                    } else if s
+                        .cursor
+                        .step(CursorDir::Down, count, &*s.cache, s.total_rows)
+                    {
+                        s.sync_cursor_visible(CursorDir::Down);
+                    }
+                });
             }
             Action::CursorRecordPrev | Action::CursorPageUp => {
-                self.dismiss_preview();
-                let count = if action == Action::CursorPageUp {
-                    self.visible_height
-                } else {
-                    1
-                };
-                if !self.cursor.visible {
-                    self.cursor.place_at_last_visible(
-                        &self.anchor,
-                        &*self.cache,
-                        self.visible_height,
-                    );
-                } else if self
-                    .cursor
-                    .step(CursorDir::Up, count, &*self.cache, self.total_rows)
-                {
-                    self.sync_cursor_visible(CursorDir::Up);
-                }
-                self.clamp_cursor_column();
+                self.navigate(|s| {
+                    let count = if action == Action::CursorPageUp {
+                        s.visible_height
+                    } else {
+                        1
+                    };
+                    if !s.cursor.visible {
+                        s.cursor.place_at_last_visible(
+                            &s.anchor,
+                            &*s.cache,
+                            s.visible_height,
+                        );
+                    } else if s
+                        .cursor
+                        .step(CursorDir::Up, count, &*s.cache, s.total_rows)
+                    {
+                        s.sync_cursor_visible(CursorDir::Up);
+                    }
+                });
             }
             Action::CellLeft => {
                 self.dismiss_preview();

@@ -57,6 +57,18 @@ pub struct DataPath {
     pub steps: SmallVec<[PathStep; 6]>,
 }
 
+impl DataPath {
+    /// Returns the path with Index steps removed — the structural "shape"
+    /// that is comparable across array instances and records.
+    pub fn skeleton(&self) -> SmallVec<[PathStep; 6]> {
+        self.steps
+            .iter()
+            .copied()
+            .filter(|s| matches!(s, PathStep::Field(_)))
+            .collect()
+    }
+}
+
 /// Column slice within a rendered line, identified from the DataNode tree.
 pub struct ColumnSlice {
     pub start: usize,
@@ -653,6 +665,20 @@ impl RenderedRow {
 
         steps.reverse();
         DataPath { steps }
+    }
+
+    /// Find the column index on `line_idx` whose data path skeleton matches `skeleton`.
+    /// Returns None if the line has no table info or no column matches.
+    pub fn find_column_by_skeleton(&self, line_idx: usize, skeleton: &[PathStep]) -> Option<usize> {
+        let info = self.line_table_info(line_idx)?;
+        info.columns.iter().enumerate().find_map(|(i, col)| {
+            let col_path = self.data_path(col.node);
+            if col_path.skeleton().as_slice() == skeleton {
+                Some(i)
+            } else {
+                None
+            }
+        })
     }
 
     pub fn line_for_node(&self, node: NodeRef) -> Option<usize> {

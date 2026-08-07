@@ -74,10 +74,11 @@ impl CursorState {
     }
 
     /// Jump to the start of a record (e.g. for n/p, g/G, search jumps).
+    /// Does NOT clear selected_col — column resolution after a record
+    /// change is an app-level concern (path skeleton matching).
     pub fn jump_to_record(&mut self, record: usize) {
         self.record = record;
         self.line = 0;
-        self.selected_col = None;
     }
 
     /// Move column cursor left within a table row.
@@ -106,14 +107,15 @@ impl CursorState {
     }
 
     /// Place cursor on the first visible line (viewport top).
+    /// Does NOT clear selected_col — resolution is the caller's job.
     pub fn place_at_first_visible(&mut self, anchor: &ViewportAnchor) {
         self.record = anchor.row();
         self.line = anchor.line_offset();
-        self.selected_col = None;
         self.visible = true;
     }
 
     /// Place cursor on the last visible line (viewport bottom).
+    /// Does NOT clear selected_col — resolution is the caller's job.
     pub fn place_at_last_visible(
         &mut self,
         anchor: &ViewportAnchor,
@@ -142,7 +144,6 @@ impl CursorState {
         }
         self.record = row;
         self.line = line;
-        self.selected_col = None;
         self.visible = true;
     }
 
@@ -181,6 +182,16 @@ impl CursorState {
                 self.selected_col = None;
             }
             None => {}
+        }
+    }
+
+    /// Like `clamp_selected_col`, but never clears to None.
+    /// Used in table mode where every row shares the same schema.
+    pub fn clamp_selected_col_keep(&mut self, column_count: usize) {
+        if let Some(col) = self.selected_col
+            && column_count >= 2
+        {
+            self.selected_col = Some(col.min(column_count - 1));
         }
     }
 
@@ -388,7 +399,7 @@ mod tests {
         c.jump_to_record(3);
         assert_eq!(c.record, 3);
         assert_eq!(c.line, 0);
-        assert_eq!(c.selected_col, None);
+        assert_eq!(c.selected_col, Some(2)); // preserved — resolution is caller's job
     }
 
     #[test]
@@ -475,6 +486,22 @@ mod tests {
         let mut c = CursorState::new();
         c.clamp_selected_col(5);
         assert_eq!(c.selected_col, None);
+    }
+
+    #[test]
+    fn clamp_selected_col_keep_preserves_on_non_table() {
+        let mut c = CursorState::new();
+        c.selected_col = Some(2);
+        c.clamp_selected_col_keep(0);
+        assert_eq!(c.selected_col, Some(2)); // never clears
+    }
+
+    #[test]
+    fn clamp_selected_col_keep_clamps_within_range() {
+        let mut c = CursorState::new();
+        c.selected_col = Some(5);
+        c.clamp_selected_col_keep(3);
+        assert_eq!(c.selected_col, Some(2));
     }
 
     #[test]
