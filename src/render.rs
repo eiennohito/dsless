@@ -480,6 +480,7 @@ impl RenderSpecNode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_nested_table(
     sa: &StructArray,
     start: usize,
@@ -620,12 +621,11 @@ impl RenderedRow {
         if line_idx >= self.line_count() {
             return None;
         }
-        if let Some(col) = selected_col {
-            if let Some(info) = self.line_table_info(line_idx) {
-                if let Some(col_slice) = info.columns.get(col) {
-                    return Some(col_slice.node);
-                }
-            }
+        if let Some(col) = selected_col
+            && let Some(info) = self.line_table_info(line_idx)
+            && let Some(col_slice) = info.columns.get(col)
+        {
+            return Some(col_slice.node);
         }
         let line_byte = self.line_starts[line_idx] as u32;
         self.deepest_node_at(line_byte).map(|i| NodeRef(i as u16))
@@ -818,6 +818,12 @@ pub struct LineWriter {
     node_stack: Vec<usize>,
 }
 
+impl Default for LineWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LineWriter {
     pub fn new() -> Self {
         LineWriter {
@@ -876,10 +882,10 @@ impl LineWriter {
     }
 
     pub(crate) fn mark_constrained(&mut self) {
-        if let Some(&idx) = self.node_stack.last() {
-            if Fidelity::Constrained > self.nodes[idx].fidelity {
-                self.nodes[idx].fidelity = Fidelity::Constrained;
-            }
+        if let Some(&idx) = self.node_stack.last()
+            && Fidelity::Constrained > self.nodes[idx].fidelity
+        {
+            self.nodes[idx].fidelity = Fidelity::Constrained;
         }
     }
 

@@ -103,13 +103,12 @@ pub(super) fn draw(
                     if is_cursor_line {
                         cursor_screen_y = screen_line;
                         if let (Some(col), Some(info)) = (app_ref.cursor.selected_col, &table_info)
+                            && let Some(col_slice) = info.columns.get(col)
                         {
-                            if let Some(col_slice) = info.columns.get(col) {
-                                let path = rendered.data_path(col_slice.node);
-                                let full_name = data_path_name(&app_ref.spec.root, &path);
-                                let short_name = full_name.rsplit('.').next().unwrap_or(&full_name);
-                                cursor_col_name = format!(" | [col: {}]", short_name);
-                            }
+                            let path = rendered.data_path(col_slice.node);
+                            let full_name = data_path_name(&app_ref.spec.root, &path);
+                            let short_name = full_name.rsplit('.').next().unwrap_or(&full_name);
+                            cursor_col_name = format!(" | [col: {}]", short_name);
                         }
                     }
                     let label_prefix = overlay_here

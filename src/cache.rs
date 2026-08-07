@@ -65,6 +65,12 @@ pub struct RowCache {
     inner: RwLock<SizedLruCache<usize, Arc<RenderedRow>>>,
 }
 
+impl Default for RowCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RowCache {
     pub fn new() -> Self {
         RowCache {

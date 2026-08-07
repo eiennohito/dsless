@@ -201,11 +201,11 @@ fn resolve_struct(
 
     let spread_rightmost = find_spread_rightmost(&nodes);
     let mut display_order = identity_order;
-    if let Some(ri) = spread_rightmost {
-        if ri != num_fields - 1 {
-            display_order.retain(|&i| i != ri);
-            display_order.push(ri);
-        }
+    if let Some(ri) = spread_rightmost
+        && ri != num_fields - 1
+    {
+        display_order.retain(|&i| i != ri);
+        display_order.push(ri);
     }
 
     let ordered_nodes: Vec<&LayoutNode> = display_order.iter().map(|&i| nodes[i]).collect();
